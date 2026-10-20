@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 5,
+  "owner": "asteriskmeta",
+  "coreType": "mihomo",
+  "coreExecutablePath": "/data/app/example/lib/arm64/libmihomo.so",
+  "coreConfigPath": "/data/user/0/example.app/files/clash/config.yaml",
+  "statePath": "/data/user/0/example.app/files/clash/asteriskd.state",
+  "logPath": "/data/user/0/example.app/files/clash/logs/asteriskd.log",
+  "mode": "tproxy",
+  "core": {
+    "workingDirectory": "/data/user/0/example.app/files/clash",
+    "readinessTimeoutMilliseconds": 5000,
+    "ageSecretKey": null
+  },
+  "network": {
+    "enableIpv6": true,
+    "disableSystemIpv6": false,
+    "enableLocalDns": false,
+    "enableFakeDns": false,
+    "fakeDnsIpv4Pool": null,
+    "ignoredInterfaces": [],
+    "virtualInterfaces": [],
+    "hotspotInterfacePrefixes": [],
+    "proxyPrivateCidrs": [
+      "100.101.102.103/32",
+      "fd7a:115c:a1e0::abcd/128"
+    ],
+    "bypassPrivateCidrs": [
+      "0.0.0.0/8",
+      "10.0.0.0/8",
+      "100.64.0.0/10",
+      "127.0.0.0/8",
+      "169.254.0.0/16",
+      "172.16.0.0/12",
+      "192.0.0.0/24",
+      "192.0.2.0/24",
+      "192.88.99.0/24",
+      "192.168.0.0/16",
+      "198.51.100.0/24",
+      "203.0.113.0/24",
+      "224.0.0.0/4",
+      "240.0.0.0/4",
+      "255.255.255.255/32",
+      "::/128",
+      "::1/128",
+      "::ffff:0:0/96",
+      "100::/64",
+      "64:ff9b::/96",
+      "2001::/32",
+      "2001:10::/28",
+      "2001:20::/28",
+      "2001:db8::/32",
+      "2002::/16",
+      "fc00::/7",
+      "fe80::/10",
+      "ff00::/8"
+    ],
+    "appPolicy": {
+      "mode": "global",
+      "uids": [],
+      "bypassUids": [],
+      "directCidrPathV4": null,
+      "directCidrPathV6": null
+    }
+  },
+  "modeOptions": {
+    "transparentPort": 65535,
+    "tunnelName": null
+  },
+  "matcher": null,
+  "helper": null,
+  "serviceControl": {
+    "enabled": false,
+    "schedule": {
+      "enabled": false,
+      "startCron": "",
+      "stopCron": ""
+    },
+    "wifi": {
+      "enabled": false,
+      "connectStart": {
+        "enabled": false,
+        "ssids": [],
+        "bssids": []
+      },
+      "connectStop": {
+        "enabled": false,
+        "ssids": [],
+        "bssids": []
+      },
+      "disconnectStart": {
+        "enabled": false,
+        "ssids": [],
+        "bssids": []
+      },
+      "disconnectStop": {
+        "enabled": false,
+        "ssids": [],
+        "bssids": []
+      }
+    },
+    "keyguard": {
+      "enabled": false,
+      "lockStart": false,
+      "lockStop": false,
+      "unlockStart": false,
+      "unlockStop": false
+    }
+  },
+  "dnsEnhancement": null
+}

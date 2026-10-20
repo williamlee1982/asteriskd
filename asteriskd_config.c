@@ -131,6 +131,44 @@ static int object_fields(
     return 0;
 }
 
+/* Like object_fields, but names[required_count..name_count) may be absent
+ * (their values stay TOKEN_NONE). Unknown keys are still rejected. */
+static int object_fields_optional(
+    const struct asteriskd_json_document *document,
+    size_t object,
+    const char *const *names,
+    size_t required_count,
+    size_t name_count,
+    size_t *values) {
+    if (document->tokens[object].type != ASTERISKD_JSON_OBJECT || name_count > 64U ||
+        required_count > name_count) return -1;
+    for (size_t index = 0U; index < name_count; ++index) values[index] = TOKEN_NONE;
+    size_t cursor = object + 1U;
+    size_t pairs = 0U;
+    while (true) {
+        size_t key = next_direct(document, object, cursor);
+        if (key == TOKEN_NONE) break;
+        size_t value = next_direct(document, object, key + 1U);
+        if (value == TOKEN_NONE || document->tokens[key].type != ASTERISKD_JSON_STRING) return -1;
+        size_t field = TOKEN_NONE;
+        for (size_t index = 0U; index < name_count; ++index) {
+            if (token_equals(document, key, names[index])) {
+                field = index;
+                break;
+            }
+        }
+        if (field == TOKEN_NONE || values[field] != TOKEN_NONE) return -1;
+        values[field] = value;
+        ++pairs;
+        cursor = value + 1U;
+    }
+    for (size_t index = 0U; index < required_count; ++index) {
+        if (values[index] == TOKEN_NONE) return -1;
+    }
+    if (document->tokens[object].child_count != pairs) return -1;
+    return 0;
+}
+
 static int find_field(
     const struct asteriskd_json_document *document,
     size_t object,
@@ -607,9 +645,14 @@ static int parse_network(
         "enableIpv6", "disableSystemIpv6", "enableLocalDns", "enableFakeDns", "fakeDnsIpv4Pool",
         "ignoredInterfaces", "virtualInterfaces", "hotspotInterfacePrefixes", "proxyPrivateCidrs",
         "bypassPrivateCidrs", "appPolicy",
+        /* optional */ "captureBoundNetworks", "blockEncryptedDns",
     };
-    size_t values[11];
-    if (object_fields(document, object, names, 11U, values) != 0 ||
+    size_t values[13];
+    if (object_fields_optional(document, object, names, 11U, 13U, values) != 0 ||
+        (values[11] != TOKEN_NONE &&
+            parse_bool(document, values[11], &config->capture_bound_networks) != 0) ||
+        (values[12] != TOKEN_NONE &&
+            parse_bool(document, values[12], &config->block_encrypted_dns) != 0) ||
         parse_bool(document, values[0], &config->enable_ipv6) != 0 ||
         parse_bool(document, values[1], &config->disable_system_ipv6) != 0 ||
         parse_bool(document, values[2], &config->enable_local_dns) != 0 ||

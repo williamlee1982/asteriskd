@@ -289,6 +289,10 @@ int asteriskd_cli_parse(
         invocation->command = ASTERISKD_CLI_START;
     } else if (strcmp(argv[1], "monitor") == 0 && strcmp(argv[2], "--config") == 0) {
         invocation->command = ASTERISKD_CLI_MONITOR;
+    } else if (strcmp(argv[1], "cleanup") == 0 && strcmp(argv[2], "--config") == 0) {
+        invocation->command = ASTERISKD_CLI_CLEANUP;
+    } else if (strcmp(argv[1], "guard") == 0 && strcmp(argv[2], "--config") == 0) {
+        invocation->command = ASTERISKD_CLI_GUARD;
     } else {
         goto invalid;
     }
@@ -2035,6 +2039,8 @@ int asteriskd_cli_main_with_backend(
     if (backend->effective_uid(context) != 0U) {
         const char *request_id = invocation.command == ASTERISKD_CLI_START ? "start" :
             invocation.command == ASTERISKD_CLI_MONITOR ? "monitor" :
+            invocation.command == ASTERISKD_CLI_CLEANUP ? "cleanup" :
+            invocation.command == ASTERISKD_CLI_GUARD ? "guard" :
             invocation.command == ASTERISKD_CLI_STATUS ? "status" :
             invocation.command == ASTERISKD_CLI_STOP ? "stop" :
             invocation.command == ASTERISKD_CLI_SHUTDOWN ? "shutdown" :
@@ -2065,6 +2071,31 @@ int asteriskd_cli_main_with_backend(
             invocation.watch_until_running);
     }
 
+    if (invocation.command == ASTERISKD_CLI_CLEANUP ||
+        invocation.command == ASTERISKD_CLI_GUARD) {
+        bool guard = invocation.command == ASTERISKD_CLI_GUARD;
+        const char *request_id = guard ? "guard" : "cleanup";
+        if (backend->run_cleanup == NULL) {
+            return control_cli_write_response(backend, context, request_id,
+                ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR, NULL, "cleanup is unavailable");
+        }
+        bool has_early_result = false;
+        struct asteriskd_control_result early_result;
+        memset(&early_result, 0, sizeof(early_result));
+        int status = backend->run_cleanup(
+            context, invocation.path, guard, &has_early_result, &early_result);
+        if (has_early_result && asteriskd_control_result_valid(&early_result)) {
+            status = control_cli_write_response(
+                backend, context, request_id, early_result.code,
+                early_result.has_snapshot ? &early_result.snapshot : NULL,
+                early_result.has_message ? early_result.message : NULL);
+        } else if (status < 0) {
+            status = control_cli_write_response(backend, context, request_id,
+                ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR, NULL, "cleanup failed before initialization");
+        }
+        asteriskd_control_result_destroy(&early_result);
+        return status;
+    }
     if (invocation.command == ASTERISKD_CLI_START ||
         invocation.command == ASTERISKD_CLI_MONITOR) {
         bool has_early_result = false;
