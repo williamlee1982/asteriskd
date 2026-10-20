@@ -1191,6 +1191,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_address_set local_ipv6_snapshot;
     bool cleanup_in_progress;
     bool owned_cleanup_in_progress;
+    bool owned_cleanup_incomplete;
 };
 
 static int system_collect_local_address_set(
@@ -6369,8 +6370,11 @@ static int system_reconcile_route_table(
             if (length == 0U) continue;
             bool line_local = false;
             char line_interface[ASTERISKD_MAX_INTERFACE_NAME];
+            const struct asteriskd_config *route_config = &system->loaded_config.config;
             if (asteriskd_owned_route_line(owned->table, line, length, &line_local,
-                    line_interface, sizeof(line_interface))) {
+                    line_interface, sizeof(line_interface)) &&
+                (owned->table != ASTERISKD_TUN_TABLE || !route_config->has_tunnel_name ||
+                    strcmp(line_interface, route_config->tunnel_name) == 0)) {
                 if (!found) {
                     found = true;
                     local = line_local;
@@ -6860,6 +6864,7 @@ static int system_reconcile_owned_resources_after_listener(
     int result = asteriskd_reconcile_after_listener(
         listener_result, &backend, &report, error, error_size);
     system->owned_cleanup_in_progress = false;
+    system->owned_cleanup_incomplete = result == 0 && !asteriskd_reconcile_report_complete(&report);
     return result;
 }
 
@@ -7296,6 +7301,16 @@ static char *system_read_small_file(const char *path) {
     return buffer;
 }
 
+static void system_tproxy_autoload_probe(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family) {
+    const char *executable = system_xtables_path(family);
+    if (executable == NULL) return;
+    const char *argv[] = {executable, "-w", "100", "-t", "mangle", "-C", "PREROUTING",
+        "-p", "tcp", "-j", "TPROXY", "--on-port", "1", "--tproxy-mark", "0x1/0x1", NULL};
+    int exit_status = 0;
+    (void)system_action_run_argv(system, argv, true, &exit_status);
+}
+
 static int system_tproxy_preflight(struct asteriskd_system_supervisor *system) {
     struct asteriskd_config *config = &system->loaded_config.config;
     char path[ASTERISKD_MAX_PATH];
@@ -7306,6 +7321,18 @@ static int system_tproxy_preflight(struct asteriskd_system_supervisor *system) {
     input.have_ip = system_capability_find(NULL, "ip", path, sizeof(path)) == 1;
     char *ipv4_targets = system_read_small_file("/proc/net/ip_tables_targets");
     char *ipv6_targets = system_read_small_file("/proc/net/ip6_tables_targets");
+    /* /proc lists only loaded targets. A -C lookup makes the kernel autoload
+     * a modular xt_TPROXY; re-read the list afterwards. */
+    if (input.have_iptables && ipv4_targets != NULL && !asteriskd_tproxy_target_listed(ipv4_targets)) {
+        system_tproxy_autoload_probe(system, ASTERISKD_IP_FAMILY_IPV4);
+        free(ipv4_targets);
+        ipv4_targets = system_read_small_file("/proc/net/ip_tables_targets");
+    }
+    if (input.have_ip6tables && ipv6_targets != NULL && !asteriskd_tproxy_target_listed(ipv6_targets)) {
+        system_tproxy_autoload_probe(system, ASTERISKD_IP_FAMILY_IPV6);
+        free(ipv6_targets);
+        ipv6_targets = system_read_small_file("/proc/net/ip6_tables_targets");
+    }
     char *ipv4_matches = system_read_small_file("/proc/net/ip_tables_matches");
     char *ipv6_matches = system_read_small_file("/proc/net/ip6_tables_matches");
     input.ipv4_targets = ipv4_targets;
@@ -7905,9 +7932,24 @@ static void system_guard_release(struct asteriskd_system_supervisor *system, boo
     if (system->guard_fd < 0) return;
     const char marker = ASTERISKD_GUARD_ORDERLY_EXIT;
     ssize_t written;
+    /* A guard that already died must not SIGPIPE the supervisor: block SIGPIPE
+     * around the write and drop one raised by it. */
+    sigset_t pipe_set, previous_mask, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    sigemptyset(&pending);
+    bool masked = sigprocmask(SIG_BLOCK, &pipe_set, &previous_mask) == 0;
+    bool was_pending = masked && sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE);
     do {
         written = orderly ? write(system->guard_fd, &marker, 1U) : 0;
     } while (written < 0 && errno == EINTR);
+    if (masked) {
+        if (!was_pending && written < 0 && errno == EPIPE) {
+            const struct timespec zero = {0, 0};
+            (void)sigtimedwait(&pipe_set, NULL, &zero);
+        }
+        (void)sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+    }
     (void)close(system->guard_fd);
     system->guard_fd = -1;
 }
@@ -8177,6 +8219,14 @@ static int system_runtime_run(const char *config_path, enum system_run_kind kind
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         return 1;
     }
+    if (kind == SYSTEM_RUN_CLEANUP && system.owned_cleanup_incomplete) {
+        *has_early_result = true;
+        (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+            "cleanup incomplete: owned rules or routes remain; see asteriskd log", NULL);
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return asteriskd_control_result_exit_code(early_result->code);
+    }
     if (kind == SYSTEM_RUN_CLEANUP) {
         *has_early_result = true;
         asteriskd_control_result_destroy(early_result);
@@ -8196,6 +8246,11 @@ static int system_runtime_run(const char *config_path, enum system_run_kind kind
         return asteriskd_control_result_exit_code(early_result->code);
     }
     system_guard_spawn(&system, config_path);
+    if (system.guard_fd < 0) {
+        (void)asteriskd_log_line(&system.logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "supervisor-death guard unavailable; an unclean exit needs `asteriskd cleanup`");
+    }
     asteriskd_control_server_enable_accepting(system.control, true);
     struct asteriskd_runtime_effect_backend effects = system_runtime_effects(&system);
     int status = 0;

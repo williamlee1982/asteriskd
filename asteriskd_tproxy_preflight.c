@@ -144,6 +144,14 @@ int asteriskd_tproxy_preflight_evaluate(
         return ASTERISKD_CONFIG_UNSUPPORTED_COMBINATION;
     }
     capabilities->ipv6_available = ipv6_usable;
+    if (ipv6_dns_only && !ipv6_usable && input->ipv6_stack_present) {
+        /* IPv6 is live but cannot be intercepted: IPv6 DNS would bypass local DNS. */
+        set_text(error, error_size,
+            "TPROXY preflight failed: IPv6 is active but ip6tables or the IPv6 TPROXY target "
+            "is unavailable, so IPv6 DNS would bypass local DNS; enable Disable system IPv6 "
+            "or turn off local DNS");
+        return ASTERISKD_CONFIG_UNSUPPORTED_COMBINATION;
+    }
     if (ipv6_dns_only && !ipv6_usable) {
         append_text(warning, warning_size,
             "IPv6 stack, ip6tables or IPv6 TPROXY unavailable; skipping IPv6 DNS interception");
@@ -155,4 +163,8 @@ int asteriskd_tproxy_preflight_evaluate(
             "xt_socket match unavailable; established transparent-socket guard disabled");
     }
     return 0;
+}
+
+bool asteriskd_tproxy_target_listed(const char *targets) {
+    return targets != NULL && list_has_name(targets, "TPROXY");
 }

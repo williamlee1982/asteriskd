@@ -117,6 +117,34 @@ static void test_preflight_no_ipv6_skips_dns_only_path(void) {
     CHECK_CONTAINS(warning, "IPv6");
 }
 
+/* Review follow-up: an IPv6 stack without usable ip6tables/TPROXY must not
+ * silently let IPv6 DNS bypass local DNS. */
+static void test_preflight_ipv6_stack_without_ip6tables_fails_closed(void) {
+    struct asteriskd_config config = base_config();
+    struct asteriskd_tproxy_preflight_input input = full_input();
+    input.have_ip6tables = false;
+    struct asteriskd_tproxy_capabilities caps;
+    char warning[256] = "", error[256] = "";
+    CHECK(asteriskd_tproxy_preflight_evaluate(&config, &input, &caps, warning, sizeof(warning), error, sizeof(error)) != 0);
+    CHECK_CONTAINS(error, "Disable system IPv6");
+    config.disable_system_ipv6 = true;
+    CHECK(asteriskd_tproxy_preflight_evaluate(&config, &input, &caps, warning, sizeof(warning), error, sizeof(error)) == 0);
+}
+
+static void test_reconcile_report_complete(void) {
+    struct asteriskd_reconcile_report report;
+    memset(&report, 0, sizeof(report));
+    report.failed_phase = ASTERISKD_RECONCILE_PHASE_COUNT;
+    report.verified_absent = true;
+    CHECK(asteriskd_reconcile_report_complete(&report));
+    report.verified_absent = false;
+    CHECK(!asteriskd_reconcile_report_complete(&report));
+    report.verified_absent = true;
+    report.failed_phase = ASTERISKD_RECONCILE_QUIESCE;
+    CHECK(!asteriskd_reconcile_report_complete(&report));
+    CHECK(!asteriskd_reconcile_report_complete(NULL));
+}
+
 static void test_preflight_no_ipv6_with_ipv6_proxy_fails(void) {
     struct asteriskd_config config = base_config();
     config.enable_ipv6 = true;
@@ -258,6 +286,8 @@ int main(void) {
         {"preflight_no_ipv6_skips_dns_only_path", test_preflight_no_ipv6_skips_dns_only_path},
         {"preflight_no_ipv6_with_ipv6_proxy_fails", test_preflight_no_ipv6_with_ipv6_proxy_fails},
         {"preflight_without_xt_socket", test_preflight_without_xt_socket},
+        {"preflight_ipv6_stack_without_ip6tables_fails_closed", test_preflight_ipv6_stack_without_ip6tables_fails_closed},
+        {"reconcile_report_complete", test_reconcile_report_complete},
         {"config_without_new_flags_still_parses", test_config_without_new_flags_still_parses},
         {"config_new_flags_parse", test_config_new_flags_parse},
         {"cli_cleanup_and_guard_parse", test_cli_cleanup_and_guard_parse},

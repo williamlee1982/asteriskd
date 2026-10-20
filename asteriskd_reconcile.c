@@ -192,3 +192,8 @@ int asteriskd_reconcile_after_listener(
     return asteriskd_reconcile_owned_resources(
         backend, report, error, error_size);
 }
+
+bool asteriskd_reconcile_report_complete(const struct asteriskd_reconcile_report *report) {
+    return report != NULL && report->verified_absent &&
+        report->failed_phase == ASTERISKD_RECONCILE_PHASE_COUNT;
+}

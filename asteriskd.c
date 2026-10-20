@@ -133,6 +133,16 @@ static int system_run_cleanup(
             "supervisor exited without orderly teardown; running cleanup-only pass");
     }
     int status = asteriskd_runtime_cleanup_system(config_path, has_early_result, early_result);
+    /* The guard is the only cleanup after an unclean exit: retry a failed or
+     * incomplete pass a few times, but never fight a live supervisor. */
+    for (int attempt = 1; guard && status != 0 && attempt < 3; ++attempt) {
+        if (*has_early_result && early_result->code == ASTERISKD_CONTROL_RESULT_ALREADY_RUNNING) break;
+        system_log_early_result("guard", status, *has_early_result, early_result);
+        if (*has_early_result) asteriskd_control_result_destroy(early_result);
+        *has_early_result = false;
+        (void)sleep(2U);
+        status = asteriskd_runtime_cleanup_system(config_path, has_early_result, early_result);
+    }
     system_log_early_result(guard ? "guard" : "cleanup", status, *has_early_result, early_result);
     return status;
 }

@@ -369,6 +369,44 @@ static void test_route_reconcile_tun_table(void) {
     free_system(s);
 }
 
+/* Review follow-up: with a configured tunnel, table 168 routes on other
+ * interfaces are foreign even if they have the same shape. */
+static void test_route_reconcile_tun_table_matches_configured_tunnel(void) {
+    struct asteriskd_system_supervisor *s = new_system();
+    s->rule_commands.active = false;
+    s->loaded_config.config.has_tunnel_name = true;
+    snprintf(s->loaded_config.config.tunnel_name, sizeof(s->loaded_config.config.tunnel_name), "%s", "tun0");
+    asteriskd_test_action_hook = fake_action;
+    fake_log[0] = '\0';
+    snprintf(fake_stdout, sizeof(fake_stdout), "%s", "default dev tun7 scope link\n");
+    const struct system_owned_route_table owned = {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE};
+    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
+    CHECK_NOT_CONTAINS(fake_log, " del ");
+    snprintf(fake_stdout, sizeof(fake_stdout), "%s", "default dev tun0 scope link\ndefault dev tun7 scope link\n");
+    fake_log[0] = '\0';
+    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
+    CHECK_CONTAINS(fake_log, "route del default dev tun0 table 168");
+    CHECK_NOT_CONTAINS(fake_log, "dev tun7 table");
+    asteriskd_test_action_hook = NULL;
+    free_system(s);
+}
+
+/* Review follow-up: a dead guard must not SIGPIPE the supervisor. */
+static void test_guard_release_survives_dead_guard(void) {
+    struct asteriskd_system_supervisor *s = new_system();
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    close(fds[0]);
+    s->guard_fd = fds[1];
+    system_guard_release(s, true);
+    CHECK(s->guard_fd == -1);
+    sigset_t pending;
+    sigemptyset(&pending);
+    CHECK(sigpending(&pending) == 0);
+    CHECK(!sigismember(&pending, SIGPIPE));
+    free_system(s);
+}
+
 static void test_route_reconcile_missing_table_is_clean(void) {
     struct asteriskd_system_supervisor *s = new_system();
     s->rule_commands.active = false;
@@ -402,6 +440,8 @@ int main(void) {
         {"route_reconcile_keeps_foreign_routes", test_route_reconcile_keeps_foreign_routes},
         {"route_reconcile_tun_table", test_route_reconcile_tun_table},
         {"route_reconcile_missing_table_is_clean", test_route_reconcile_missing_table_is_clean},
+        {"route_reconcile_tun_table_matches_configured_tunnel", test_route_reconcile_tun_table_matches_configured_tunnel},
+        {"guard_release_survives_dead_guard", test_guard_release_survives_dead_guard},
     };
     return run_tests("runtime", cases, sizeof(cases) / sizeof(cases[0]));
 }

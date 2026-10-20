@@ -1268,6 +1268,8 @@ struct asteriskd_reconcile_report {
 int asteriskd_reconcile_owned_resources(
     const struct asteriskd_reconcile_backend *,
     struct asteriskd_reconcile_report *, char *, size_t);
+/* True when every phase succeeded and nothing owned remains. */
+bool asteriskd_reconcile_report_complete(const struct asteriskd_reconcile_report *);
 int asteriskd_owned_policy_rule_output_count(
     const char *, size_t, const struct asteriskd_owned_policy_rule *, size_t *);
 
@@ -2131,6 +2133,8 @@ struct asteriskd_tproxy_capabilities {
     bool socket_match_ipv6;
 };
 
+/* True only when a readable target list names TPROXY. */
+bool asteriskd_tproxy_target_listed(const char *targets);
 int asteriskd_tproxy_preflight_evaluate(
     const struct asteriskd_config *, const struct asteriskd_tproxy_preflight_input *,
     struct asteriskd_tproxy_capabilities *, char *warning, size_t warning_size,
