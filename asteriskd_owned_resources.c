@@ -3,6 +3,8 @@
 
 #include "asteriskd.h"
 
+#include <string.h>
+
 static const char *const owned_pin_paths[ASTERISKD_PIN_COUNT] = {
     [ASTERISKD_PIN_MATCHER_OUTPUT_V4] =
         "/sys/fs/bpf/asterisk/xt_output_v4",
@@ -131,6 +133,12 @@ static const struct asteriskd_owned_policy_rule owned_policy_rules[] = {
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE,
         ASTERISKD_ROUTE_RULE_PRIORITY, ASTERISKD_PRIMARY_MARK,
         ASTERISKD_MARK_MASK, false},
+    {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE,
+        ASTERISKD_CAPTURE_ROUTE_RULE_PRIORITY, ASTERISKD_PRIMARY_MARK,
+        ASTERISKD_MARK_MASK, false},
+    {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_TABLE,
+        ASTERISKD_CAPTURE_ROUTE_RULE_PRIORITY, ASTERISKD_PRIMARY_MARK,
+        ASTERISKD_MARK_MASK, false},
 };
 
 static const struct asteriskd_owned_resource_catalog owned_resource_catalog = {
@@ -160,4 +168,54 @@ const struct asteriskd_owned_resource_catalog *asteriskd_owned_resource_catalog(
 const char *asteriskd_owned_pin_path(enum asteriskd_pin_id pin_id) {
     if ((unsigned int)pin_id >= ASTERISKD_PIN_COUNT) return NULL;
     return owned_pin_paths[pin_id];
+}
+
+static size_t route_next_token(const char *line, size_t length, size_t offset,
+    size_t *start, size_t *end) {
+    while (offset < length && (line[offset] == ' ' || line[offset] == '\t')) ++offset;
+    *start = offset;
+    while (offset < length && line[offset] != ' ' && line[offset] != '\t') ++offset;
+    *end = offset;
+    return offset;
+}
+
+static bool route_token_is(const char *line, size_t start, size_t end, const char *word) {
+    size_t length = strlen(word);
+    return end - start == length && memcmp(line + start, word, length) == 0;
+}
+
+/* Recognize the routes asteriskd installs in its tables:
+ *   160: "local default dev lo ..."      168: "default dev <if> ..." (no gateway)
+ * Everything else belongs to someone else and must not be deleted. */
+bool asteriskd_owned_route_line(uint32_t table, const char *line, size_t length,
+    bool *local, char *interface_name, size_t interface_size) {
+    if (line == NULL || local == NULL || interface_name == NULL || interface_size == 0U) {
+        return false;
+    }
+    size_t start = 0U, end = 0U, offset = 0U;
+    *local = false;
+    interface_name[0] = '\0';
+    offset = route_next_token(line, length, offset, &start, &end);
+    if (route_token_is(line, start, end, "local")) {
+        *local = true;
+        offset = route_next_token(line, length, offset, &start, &end);
+    }
+    if (!route_token_is(line, start, end, "default")) return false;
+    offset = route_next_token(line, length, offset, &start, &end);
+    if (!route_token_is(line, start, end, "dev")) return false;
+    offset = route_next_token(line, length, offset, &start, &end);
+    size_t name_length = end - start;
+    if (name_length == 0U || name_length >= interface_size ||
+        name_length >= ASTERISKD_MAX_INTERFACE_NAME) return false;
+    memcpy(interface_name, line + start, name_length);
+    interface_name[name_length] = '\0';
+    while (offset < length) {
+        offset = route_next_token(line, length, offset, &start, &end);
+        if (start == end) break;
+        if (route_token_is(line, start, end, "via") ||
+            route_token_is(line, start, end, "nexthop")) return false;
+    }
+    if (table == ASTERISKD_TPROXY_TABLE) return *local && strcmp(interface_name, "lo") == 0;
+    if (table == ASTERISKD_TUN_TABLE) return !*local;
+    return false;
 }

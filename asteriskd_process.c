@@ -633,6 +633,11 @@ int asteriskd_readiness_poll(
                 backend->context, identity->pid, config->transparent_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
+        if (ready && backend->udp_ready != NULL &&
+            backend->udp_ready(backend->context, identity->pid, config->transparent_port,
+                &ready) != 0) {
+            return ASTERISKD_READINESS_IO;
+        }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
         if (backend->interface_exists(
                 backend->context, config->tunnel_name, &ready) != 0) return ASTERISKD_READINESS_IO;
@@ -677,7 +682,7 @@ int asteriskd_readiness_target_describe(
     if (config == NULL || !readiness_role_valid(config, role)) return ASTERISKD_CONFIG_INVALID;
     int written = -1;
     if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TPROXY) {
-        written = snprintf(out, size, "tcp-listener:%u", (unsigned)config->transparent_port);
+        written = snprintf(out, size, "tcp-listener+udp:%u", (unsigned)config->transparent_port);
     } else if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
         written = snprintf(out, size, "interface:%s", config->tunnel_name);
     } else if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
@@ -1343,24 +1348,50 @@ static int system_context_child_alive(
     return 0;
 }
 
-/* Match the port marker anywhere in the TCP table. Socket ownership is not
- * verified: the stricter /proc/<pid>/fd check failed readiness on some devices. */
-static bool process_listener_file_matches(const char *path, uint16_t port) {
-    char marker[8U];
-    int length = snprintf(marker, sizeof(marker), ":%04X ", (unsigned)port);
-    if (length <= 0 || (size_t)length >= sizeof(marker)) return false;
+/* Require the port in the local-address column with state LISTEN (tcp) or a
+ * bound socket (udp). Socket ownership is not verified: the stricter
+ * /proc/<pid>/fd check failed readiness on some devices. */
+static bool process_listener_file_matches(const char *path, uint16_t port, bool udp) {
     FILE *file = fopen(path, "re");
     if (file == NULL) return false;
     char *line = NULL;
     size_t capacity = 0U;
     bool matched = false;
+    bool header = true;
     while (getline(&line, &capacity, file) >= 0) {
-        if (strstr(line, marker) != NULL) matched = true;
+        if (header) {
+            header = false;
+            continue;
+        }
+        size_t length = strlen(line);
+        while (length > 0U && (line[length - 1U] == '\n' || line[length - 1U] == '\r')) --length;
+        if (asteriskd_proc_net_line_has_socket(line, length, port, udp)) matched = true;
     }
     bool complete = feof(file) != 0 && ferror(file) == 0;
     free(line);
     (void)fclose(file);
     return complete && matched;
+}
+
+static int system_context_proc_tables_match(int pid, uint16_t port, bool udp, bool *ready) {
+    static const char *const tcp_tables[] = {"net/tcp6", "net/tcp"};
+    static const char *const udp_tables[] = {"net/udp6", "net/udp"};
+    const char *const *tables = udp ? udp_tables : tcp_tables;
+    *ready = false;
+    for (size_t index = 0U; index < 2U; ++index) {
+        char path[64U];
+        if (system_proc_path(path, sizeof(path), pid, tables[index]) != 0) return -1;
+        if (process_listener_file_matches(path, port, udp)) {
+            *ready = true;
+            break;
+        }
+    }
+    return 0;
+}
+
+static int system_context_udp_ready(void *opaque, int pid, uint16_t port, bool *ready) {
+    (void)opaque;
+    return system_context_proc_tables_match(pid, port, true, ready);
 }
 
 static int system_context_listener_ready(
@@ -1369,17 +1400,7 @@ static int system_context_listener_ready(
     uint16_t port,
     bool *ready) {
     (void)opaque;
-    *ready = false;
-    static const char *const tables[] = {"net/tcp6", "net/tcp"};
-    for (size_t index = 0U; index < sizeof(tables) / sizeof(tables[0]); ++index) {
-        char path[64U];
-        if (system_proc_path(path, sizeof(path), pid, tables[index]) != 0) return -1;
-        if (process_listener_file_matches(path, port)) {
-            *ready = true;
-            break;
-        }
-    }
-    return 0;
+    return system_context_proc_tables_match(pid, port, false, ready);
 }
 
 static int system_context_signal_group(
@@ -1430,6 +1451,7 @@ int asteriskd_system_process_backends_init(
     readiness->child_alive = system_context_child_alive;
     readiness->listener_ready = system_context_listener_ready;
     readiness->interface_exists = system_context_interface_exists;
+    readiness->udp_ready = system_context_udp_ready;
     stop->context = context;
     stop->identity_valid = system_context_identity_valid;
     stop->signal_group = system_context_signal_group;
