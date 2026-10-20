@@ -93,6 +93,48 @@ static void test_tailnet_bypass_order_prerouting(void) {
     free_system(s);
 }
 
+/* The document AsteriskMETA's encoder emits for the tailnet fixture
+ * (RootTailnetPrivateRoutingTest asserts byte equality with this file) goes
+ * through the daemon's real config parser and the real rule emitter. */
+static struct asteriskd_system_supervisor *system_from_fixture(const char *path) {
+    struct asteriskd_system_supervisor *s = new_system();
+    FILE *file = fopen(path, "rb");
+    CHECK(file != NULL);
+    if (file == NULL) return s;
+    static char json[65536];
+    size_t length = fread(json, 1U, sizeof(json) - 1U, file);
+    fclose(file);
+    json[length] = '\0';
+    char message[256] = "";
+    struct asteriskd_config *c = &s->loaded_config.config;
+    memset(c, 0, sizeof(*c));
+    int parsed = asteriskd_config_parse(json, length, c, message, sizeof(message));
+    if (parsed != 0) fprintf(stderr, "fixture parse: %s\n", message);
+    CHECK(parsed == 0);
+    return s;
+}
+
+static void test_tailnet_fixture_from_app_encoder(void) {
+    struct asteriskd_system_supervisor *s = system_from_fixture("fixtures/tailnet-tproxy.json");
+    CHECK(s->loaded_config.config.mode == ASTERISKD_MODE_TPROXY);
+    const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
+    long proxied = text_index(text, "'-d' '100.101.102.103/32' '-p' 'tcp'");
+    long bypass = text_index(text, "'-d' '100.64.0.0/10' '-j' 'RETURN'");
+    long catch_all = text_index(text, "'-A' 'ASTERISK_TPROXY_OUTPUT' '-p' 'tcp' '-j' 'MARK'");
+    CHECK(proxied >= 0);
+    CHECK(bypass > proxied);
+    CHECK(catch_all > bypass);
+    free_system(s);
+
+    s = system_from_fixture("fixtures/tailnet-tproxy.json");
+    text = populate(s, ASTERISKD_IP_FAMILY_IPV6, "ASTERISK_TPROXY_OUTPUT");
+    proxied = text_index(text, "'-d' 'fd7a:115c:a1e0::abcd/128' '-p' 'tcp'");
+    bypass = text_index(text, "'-d' 'fc00::/7' '-j' 'RETURN'");
+    CHECK(proxied >= 0);
+    CHECK(bypass > proxied);
+    CHECK(text_index(text, "100.101.102.103") < 0);
+    free_system(s);
+}
 
 /* H5: established transparent-socket guard before the general TPROXY rule. */
 static void test_socket_transparent_guard_both_families(void) {
@@ -347,6 +389,7 @@ int main(void) {
     static const struct test_case cases[] = {
         {"tailnet_bypass_order_output", test_tailnet_bypass_order_output},
         {"tailnet_bypass_order_prerouting", test_tailnet_bypass_order_prerouting},
+        {"tailnet_fixture_from_app_encoder", test_tailnet_fixture_from_app_encoder},
         {"socket_transparent_guard_both_families", test_socket_transparent_guard_both_families},
         {"socket_guard_skipped_without_xt_socket", test_socket_guard_skipped_without_xt_socket},
         {"core_gid_clears_primary_mark", test_core_gid_clears_primary_mark},
