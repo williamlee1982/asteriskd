@@ -48,6 +48,9 @@ struct asteriskd_runtime {
     struct asteriskd_runtime_delta pending_delta;
     bool supervising;
     bool starting_event_published;
+    /* AsteriskMETA fork: whether this cycle reached the running phase and when. */
+    bool cycle_reached_running;
+    int64_t cycle_running_since_ms;
 };
 
 void asteriskd_poll_builder_init(struct asteriskd_poll_builder *builder) {
@@ -819,6 +822,8 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
     runtime->effects = effects;
     runtime->supervising = true;
     runtime->starting_event_published = false;
+    runtime->cycle_reached_running = false;
+    runtime->cycle_running_since_ms = 0;
     asteriskd_runtime_delta_init(&runtime->pending_delta);
     struct asteriskd_lifecycle_options options = {
         .has_helper = config->helper.type != ASTERISKD_HELPER_NONE,
@@ -846,6 +851,13 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         int result = runtime_finish(runtime, reason, &startup_failure);
         runtime->supervising = false;
         return result == 0 ? 1 : result;
+    }
+    {
+        int64_t running_since = 0;
+        if (runtime->backend.monotonic_milliseconds(runtime->backend_context, &running_since) == 0) {
+            runtime->cycle_reached_running = true;
+            runtime->cycle_running_since_ms = running_since;
+        }
     }
 
     int result = 0;
@@ -1090,6 +1102,8 @@ struct asteriskd_system_supervisor {
     bool service_start_requested;
     bool service_pause_requested;
     bool service_resume_requested;
+    /* Write end of the supervisor-death guard pipe (-1 when no guard). */
+    int guard_fd;
     struct asteriskd_effect_journal volatile_effects;
     uint64_t dns_instance, dns_cycle, dns_generation;
     struct asteriskd_dns_client dns;
@@ -1098,7 +1112,12 @@ struct asteriskd_system_supervisor {
     bool dns_regenerating, dns_drain_waiting;
     int dns_hot_stage, dns_hot_result;
     struct asteriskd_control_request dns_hot_request;
+    /* AsteriskMETA fork: survives system_runtime_reset_cycle (declared before stop_requested). */
+    struct asteriskd_restart_policy restart_policy;
     bool stop_requested;
+    /* Per-cycle TPROXY capability preflight result. Unknown => upstream behaviour. */
+    bool tproxy_capabilities_known;
+    struct asteriskd_tproxy_capabilities tproxy_capabilities;
     bool automatic_stop_pending;
     bool manual_stop_pending;
     bool stopping_children;
@@ -1186,6 +1205,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_address_set local_ipv6_snapshot;
     bool cleanup_in_progress;
     bool owned_cleanup_in_progress;
+    bool owned_cleanup_incomplete;
 };
 
 static int system_collect_local_address_set(
@@ -1291,12 +1311,14 @@ static void system_service_apply_action(
             system->automatic_stop_pending = false;
         }
     } else if (action == ASTERISKD_SERVICE_ACTION_STOP) {
+        asteriskd_restart_policy_cancel(&system->restart_policy);
         system->service_start_requested = false;
         if (system->service_running) {
             system->stop_requested = true;
             system->automatic_stop_pending = true;
         }
     } else if (action == ASTERISKD_SERVICE_ACTION_SHUTDOWN) {
+        asteriskd_restart_policy_cancel(&system->restart_policy);
         system->shutdown_requested = true;
         if (system->service_running) system->stop_requested = true;
     }
@@ -1856,7 +1878,18 @@ static int system_runtime_snapshot(
 
 static int system_runtime_request_stop(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (!system->runtime->supervising) return 1;
+    if (!system->runtime->supervising) {
+        /* An explicit stop always wins over a pending automatic core restart. */
+        if (system->restart_policy.pending) {
+            asteriskd_restart_policy_cancel(&system->restart_policy);
+            system->service_start_requested = false;
+            if (!system->loaded_config.config.service_control.enabled) system->shutdown_requested = true;
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+                ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+                "pending automatic core restart cancelled by explicit stop");
+        }
+        return 1;
+    }
     system->stop_requested = true;
     system->automatic_stop_pending = false;
     system->manual_stop_pending = true;
@@ -1866,6 +1899,7 @@ static int system_runtime_request_stop(void *opaque) {
 
 static int system_runtime_request_shutdown(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
+    asteriskd_restart_policy_cancel(&system->restart_policy);
     system->shutdown_requested = true;
     system->service_start_requested = false;
     if (system->runtime->supervising) {
@@ -2627,8 +2661,19 @@ failed:
     return -1;
 }
 
+#ifdef ASTERISKD_TESTING
+/* Fake command backend for host tests (tests/runtime_test.c). */
+int (*asteriskd_test_action_hook)(struct asteriskd_system_supervisor *,
+    const char *const *, bool, int *) = NULL;
+#endif
+
 static int system_action_run_argv(struct asteriskd_system_supervisor *system,
     const char *const *argv, bool capture_stdout, int *exit_status) {
+#ifdef ASTERISKD_TESTING
+    if (asteriskd_test_action_hook != NULL) {
+        return asteriskd_test_action_hook(system, argv, capture_stdout, exit_status);
+    }
+#endif
     struct asteriskd_process_spec spec;
     memset(&spec, 0, sizeof(spec));
     if (system_action_spec(argv, &spec) != 0) return -1;
@@ -3097,6 +3142,13 @@ static int system_append_uid_return(struct asteriskd_system_supervisor *system,
 static int system_append_gid_return(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain) {
     if (system_dns_owner_direct(system,family,chain,"--gid-owner","3005") != 0) return -1;
+    // A core socket whose routing-mark carries the Asterisk primary bit would
+    // match the TPROXY ip rule and loop back into the core: clear the bit.
+    const char *clear[] = {"-m", "owner", "--gid-owner", "3005",
+        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
+        "-j", "MARK", "--set-xmark", ("0x0/" ASTERISKD_MARK_STRINGIFY(ASTERISKD_MARK_MASK))};
+    if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+            "-A", chain, clear, sizeof(clear) / sizeof(clear[0])) != 0) return -1;
     const char *arguments[] = {"-m", "owner", "--gid-owner", "3005", "-j", "RETURN"};
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, 6U);
@@ -3110,6 +3162,46 @@ static int system_append_ipsec_udp_bypass(struct asteriskd_system_supervisor *sy
             "-A", chain, ike_arguments, 8U) == 0 &&
         system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
             "-A", chain, nat_t_arguments, 8U) == 0 ? 0 : -1;
+}
+
+static bool system_socket_match_available(
+    const struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family) {
+    if (!system->tproxy_capabilities_known) return true;
+    return family == ASTERISKD_IP_FAMILY_IPV4
+        ? system->tproxy_capabilities.socket_match_ipv4
+        : system->tproxy_capabilities.socket_match_ipv6;
+}
+
+/* Optional: drop non-core DoT/DoQ (853) so Android Private DNS in automatic
+ * mode falls back to port 53, which local DNS interception covers. */
+static int system_append_encrypted_dns_block(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain) {
+    const struct asteriskd_config *config = &system->loaded_config.config;
+    if (!config->block_encrypted_dns || (!config->enable_local_dns && !config->dns_enhancement)) {
+        return 0;
+    }
+    for (unsigned p = 0; p < 2; ++p) {
+        const char *protocol = p ? "udp" : "tcp";
+        const char *args[] = {"-p", protocol, "-m", "owner", "!", "--gid-owner", "3005",
+            "-m", protocol, "--dport", "853", "-j", "DROP"};
+        if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+                args, sizeof(args) / sizeof(args[0])) != 0) return -1;
+    }
+    return 0;
+}
+
+/* Packets of an established transparent socket keep local routing and skip a
+ * second TPROXY lookup (standard TPROXY DIVERT pattern). */
+static int system_append_transparent_socket_guard(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain) {
+    if (!system_socket_match_available(system, family)) return 0;
+    const char *mark[] = {"-p", "tcp", "-m", "socket", "--transparent",
+        "-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
+    const char *skip[] = {"-p", "tcp", "-m", "socket", "--transparent", "-j", "RETURN"};
+    return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+            mark, sizeof(mark) / sizeof(mark[0])) == 0 &&
+        system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+            skip, sizeof(skip) / sizeof(skip[0])) == 0 ? 0 : -1;
 }
 
 static int system_append_mark(struct asteriskd_system_supervisor *system,
@@ -3221,6 +3313,7 @@ static int system_append_established_tcp6_dns(struct asteriskd_system_supervisor
     enum asteriskd_ip_family family, const char *chain, const char *input_interface,
     bool require_mark) {
     if (family != ASTERISKD_IP_FAMILY_IPV6) return 0;
+    if (!system_socket_match_available(system, family)) return 0;
     // The SYN already created a request socket under the original DNS tuple.
     // Let TCP receive later packets directly: old IPv6 kernels leave the
     // request's no_srccheck unset, so TPROXY can drop its completing ACK.
@@ -3455,6 +3548,7 @@ static int system_populate_common_output_prefix(
         if (system_append_uid_return(system, family, chain,
                 config->bypass_uids[remaining - 1U], true) != 0) return -1;
     }
+    if (system_append_encrypted_dns_block(system, family, chain) != 0) return -1;
     if (config->dns_enhancement && system_enhanced_dns_output(system, family, chain) != 0) return -1;
     if (config->enable_local_dns && !config->dns_enhancement && system_append_dns_mark(system, family, chain, true) != 0) {
         return -1;
@@ -3511,6 +3605,7 @@ static int system_populate_tproxy_prerouting(
         if (system_cidr_matches_family(cidr, family) &&
             system_append_return_cidr(system, family, chain, cidr) != 0) return -1;
     }
+    if (system_append_transparent_socket_guard(system, family, chain) != 0) return -1;
     if (system_append_tproxy(system, family, chain, "tcp", NULL, NULL, true, NULL) != 0 ||
         system_append_tproxy(system, family, chain, "udp", NULL, NULL, true, NULL) != 0) return -1;
     const char *matcher_path = NULL;
@@ -3538,6 +3633,7 @@ static int system_populate_tproxy_output(
         if (system_append_gid_return(system, family, chain) != 0) return -1;
         for (size_t i=0;i<config->bypass_uid_count;++i)
             if (system_append_uid_return(system,family,chain,config->bypass_uids[i],true) != 0) return -1;
+        if (system_append_encrypted_dns_block(system, family, chain) != 0) return -1;
         if (!config->dns_enhancement) return system_append_dns_mark(system, family, chain, true);
         return system_enhanced_dns_output(system, family, chain);
     }
@@ -3874,6 +3970,65 @@ static int system_probe_hook_group(struct asteriskd_system_supervisor *system,
         else *all_present = false;
     }
     return 0;
+}
+
+/* Count head-inserted hooks of `builtin` that are not within the first N rules
+ * of that builtin chain (N = head hooks of this group in that chain). */
+static int system_hook_group_order_check(const struct asteriskd_traffic_hook_group *group,
+    enum asteriskd_builtin_chain builtin, const char *bytes, size_t length,
+    size_t *misplaced) {
+    const char *chain = system_builtin_name(builtin);
+    if (group == NULL || chain == NULL || bytes == NULL || misplaced == NULL) return -1;
+    size_t head_hooks = 0U;
+    for (size_t index = 0U; index < group->hook_count; ++index) {
+        if (group->hooks[index].builtin_chain == builtin && group->hooks[index].insert_at_head) {
+            ++head_hooks;
+        }
+    }
+    *misplaced = 0U;
+    for (size_t index = 0U; index < group->hook_count; ++index) {
+        const struct asteriskd_traffic_hook *hook = &group->hooks[index];
+        if (hook->builtin_chain != builtin || !hook->insert_at_head) continue;
+        const char *arguments[ASTERISKD_XTABLES_MAX_HOOK_ARGUMENTS];
+        size_t count = asteriskd_xtables_hook_arguments(hook, arguments);
+        size_t matches = 0U;
+        size_t position = 0U;
+        if (count == 0U || asteriskd_xtables_rule_output_locate(
+                bytes, length, chain, arguments, count, &matches, &position) != 0) return -1;
+        if (matches != 1U || position == 0U || position > head_hooks) ++*misplaced;
+    }
+    return 0;
+}
+
+/* Diagnostic only: another component may insert ahead of us later. */
+static void system_warn_hook_order(struct asteriskd_system_supervisor *system) {
+    for (size_t index = 0U; index < system->rules_runtime.plan.hook_group_count; ++index) {
+        const struct asteriskd_traffic_hook_group *group =
+            &system->rules_runtime.plan.hook_groups[index];
+        for (int builtin = ASTERISKD_BUILTIN_PREROUTING; builtin < ASTERISKD_BUILTIN_COUNT; ++builtin) {
+            bool head = false;
+            for (size_t h = 0U; h < group->hook_count; ++h) {
+                if ((int)group->hooks[h].builtin_chain == builtin && group->hooks[h].insert_at_head) head = true;
+            }
+            if (!head) continue;
+            int exit_status = -1;
+            const char *chain = system_builtin_name((enum asteriskd_builtin_chain)builtin);
+            size_t misplaced = 0U;
+            if (system_xtables_run(system, group->family, group->table, "-S", chain,
+                    NULL, 0U, true, &exit_status) != 0 || exit_status != 0 ||
+                system->action_stdout_overflow ||
+                system_hook_group_order_check(group, (enum asteriskd_builtin_chain)builtin,
+                    system->action_stdout, system->action_stdout_length, &misplaced) != 0 ||
+                misplaced == 0U) continue;
+            char message[160U];
+            (void)snprintf(message, sizeof(message),
+                "Asterisk hook is not first in %s %s (family=%s); an earlier rule may bypass capture",
+                system_table_name(group->table), chain,
+                group->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4");
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+    }
 }
 
 static int system_remove_hook_group(struct asteriskd_system_supervisor *system,
@@ -6211,25 +6366,72 @@ static const struct system_owned_route_table system_owned_route_tables[] = {
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE},
 };
 
+/* Delete only the routes asteriskd installs (see asteriskd_owned_route_line);
+ * foreign routes in the same table survive and are reported once. */
 static int system_reconcile_route_table(
     struct asteriskd_system_supervisor *system,
     const struct system_owned_route_table *owned,
     bool remove) {
     char table[16U];
     const char *show[] = {"route", "show", "table", table};
-    const char *flush[] = {"route", "flush", "table", table};
     int exit_status = -1;
 
-    if (snprintf(table, sizeof(table), "%" PRIu32, owned->table) <= 0 ||
-        system_ip_command(system, owned->family, show,
-            sizeof(show) / sizeof(show[0]), true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_overflow) return -1;
-    if (system->action_stdout_length == 0U) return 0;
-    if (!remove ||
-        system_ip_command(system, owned->family, flush,
-            sizeof(flush) / sizeof(flush[0]), false, &exit_status) != 0 ||
-        exit_status != 0) return -1;
-    return 0;
+    if (snprintf(table, sizeof(table), "%" PRIu32, owned->table) <= 0) return -1;
+    for (size_t attempt = 0U; attempt < 16U; ++attempt) {
+        if (system_ip_command(system, owned->family, show,
+                sizeof(show) / sizeof(show[0]), true, &exit_status) != 0 ||
+            system->action_stdout_overflow) return -1;
+        /* Kernels with strict dumps fail "show" for a table that does not
+         * exist ("FIB table does not exist"): nothing there is ours. */
+        if (exit_status != 0) return system->action_stdout_length == 0U ? 0 : -1;
+        bool found = false;
+        bool local = false;
+        bool foreign = false;
+        char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
+        size_t offset = 0U;
+        while (offset < system->action_stdout_length) {
+            const char *line = system->action_stdout + offset;
+            const char *newline = memchr(line, '\n', system->action_stdout_length - offset);
+            size_t length = newline == NULL
+                ? system->action_stdout_length - offset : (size_t)(newline - line);
+            offset += length + 1U;
+            if (length == 0U) continue;
+            bool line_local = false;
+            char line_interface[ASTERISKD_MAX_INTERFACE_NAME];
+            const struct asteriskd_config *route_config = &system->loaded_config.config;
+            if (asteriskd_owned_route_line(owned->table, line, length, &line_local,
+                    line_interface, sizeof(line_interface)) &&
+                (owned->table != ASTERISKD_TUN_TABLE || !route_config->has_tunnel_name ||
+                    strcmp(line_interface, route_config->tunnel_name) == 0)) {
+                if (!found) {
+                    found = true;
+                    local = line_local;
+                    memcpy(interface_name, line_interface, sizeof(interface_name));
+                }
+            } else {
+                foreign = true;
+            }
+        }
+        if (foreign && attempt == 0U && remove) {
+            char message[128U];
+            (void)snprintf(message, sizeof(message),
+                "foreign routes kept in table %s (family=%s)", table,
+                owned->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4");
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+        if (!found) return 0;
+        if (!remove) return -1;
+        const char *del_local[] = {"route", "del", "local", "default", "dev", interface_name,
+            "table", table};
+        const char *del_plain[] = {"route", "del", "default", "dev", interface_name,
+            "table", table};
+        if (system_ip_command(system, owned->family, local ? del_local : del_plain,
+                local ? sizeof(del_local) / sizeof(del_local[0])
+                      : sizeof(del_plain) / sizeof(del_plain[0]),
+                false, &exit_status) != 0 || exit_status != 0) return -1;
+    }
+    return -1;
 }
 
 static void system_owned_token_effect(struct asteriskd_route_effect *effect) {
@@ -6690,6 +6892,7 @@ static int system_reconcile_owned_resources_after_listener(
     int result = asteriskd_reconcile_after_listener(
         listener_result, &backend, &report, error, error_size);
     system->owned_cleanup_in_progress = false;
+    system->owned_cleanup_incomplete = result == 0 && !asteriskd_reconcile_report_complete(&report);
     return result;
 }
 
@@ -7106,6 +7309,88 @@ hot_failed:
     return system_dns_complete(s, -1, now);
 }
 
+static char *system_read_small_file(const char *path) {
+    FILE *file = fopen(path, "re");
+    if (file == NULL) return NULL;
+    size_t capacity = 16384U;
+    char *buffer = malloc(capacity + 1U);
+    if (buffer == NULL) {
+        (void)fclose(file);
+        return NULL;
+    }
+    size_t length = fread(buffer, 1U, capacity, file);
+    bool failed = ferror(file) != 0;
+    (void)fclose(file);
+    if (failed) {
+        free(buffer);
+        return NULL;
+    }
+    buffer[length] = '\0';
+    return buffer;
+}
+
+static void system_tproxy_autoload_probe(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family) {
+    const char *executable = system_xtables_path(family);
+    if (executable == NULL) return;
+    const char *argv[] = {executable, "-w", "100", "-t", "mangle", "-C", "PREROUTING",
+        "-p", "tcp", "-j", "TPROXY", "--on-port", "1", "--tproxy-mark", "0x1/0x1", NULL};
+    int exit_status = 0;
+    (void)system_action_run_argv(system, argv, true, &exit_status);
+}
+
+static int system_tproxy_preflight(struct asteriskd_system_supervisor *system) {
+    struct asteriskd_config *config = &system->loaded_config.config;
+    char path[ASTERISKD_MAX_PATH];
+    struct asteriskd_tproxy_preflight_input input;
+    memset(&input, 0, sizeof(input));
+    input.have_iptables = system_capability_find(NULL, "iptables", path, sizeof(path)) == 1;
+    input.have_ip6tables = system_capability_find(NULL, "ip6tables", path, sizeof(path)) == 1;
+    input.have_ip = system_capability_find(NULL, "ip", path, sizeof(path)) == 1;
+    char *ipv4_targets = system_read_small_file("/proc/net/ip_tables_targets");
+    char *ipv6_targets = system_read_small_file("/proc/net/ip6_tables_targets");
+    /* /proc lists only loaded targets. A -C lookup makes the kernel autoload
+     * a modular xt_TPROXY; re-read the list afterwards. */
+    if (input.have_iptables && ipv4_targets != NULL && !asteriskd_tproxy_target_listed(ipv4_targets)) {
+        system_tproxy_autoload_probe(system, ASTERISKD_IP_FAMILY_IPV4);
+        free(ipv4_targets);
+        ipv4_targets = system_read_small_file("/proc/net/ip_tables_targets");
+    }
+    if (input.have_ip6tables && ipv6_targets != NULL && !asteriskd_tproxy_target_listed(ipv6_targets)) {
+        system_tproxy_autoload_probe(system, ASTERISKD_IP_FAMILY_IPV6);
+        free(ipv6_targets);
+        ipv6_targets = system_read_small_file("/proc/net/ip6_tables_targets");
+    }
+    char *ipv4_matches = system_read_small_file("/proc/net/ip_tables_matches");
+    char *ipv6_matches = system_read_small_file("/proc/net/ip6_tables_matches");
+    input.ipv4_targets = ipv4_targets;
+    input.ipv6_targets = ipv6_targets;
+    input.ipv4_matches = ipv4_matches;
+    input.ipv6_matches = ipv6_matches;
+    input.ipv6_stack_present = access("/proc/net/if_inet6", F_OK) == 0;
+    char warning[256U];
+    char error[256U];
+    struct asteriskd_tproxy_capabilities capabilities;
+    int result = asteriskd_tproxy_preflight_evaluate(config, &input, &capabilities,
+        warning, sizeof(warning), error, sizeof(error));
+    free(ipv4_targets);
+    free(ipv6_targets);
+    free(ipv4_matches);
+    free(ipv6_matches);
+    if (result != 0) {
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES, error);
+        return -1;
+    }
+    if (warning[0] != '\0') {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_CAPABILITY_ADJUSTED, warning);
+    }
+    system->tproxy_capabilities = capabilities;
+    system->tproxy_capabilities_known = true;
+    config->tproxy_ipv6_unavailable = !capabilities.ipv6_available;
+    return 0;
+}
+
 static int system_effect_rules(void *opaque, bool *active,
     uint64_t *generation, uint32_t *categories) {
     struct asteriskd_system_supervisor *system = opaque;
@@ -7127,7 +7412,10 @@ static int system_effect_rules(void *opaque, bool *active,
                 &system->network, error, sizeof(error)) != 0) return -1;
     }
     const char *failed_stage = NULL;
-    if (system_capture_local_address_snapshot(system) != 0) {
+    if (system->loaded_config.config.mode == ASTERISKD_MODE_TPROXY &&
+        system_tproxy_preflight(system) != 0) {
+        failed_stage = "capability-preflight";
+    } else if (system_capture_local_address_snapshot(system) != 0) {
         failed_stage = "local-address-snapshot";
     } else if (asteriskd_rules_install(&system->rules_runtime,
             &system->loaded_config.config, false,
@@ -7152,6 +7440,7 @@ static int system_effect_rules(void *opaque, bool *active,
         return -1;
     }
     system->rules_verified = true;
+    if (system->loaded_config.config.mode == ASTERISKD_MODE_TPROXY) system_warn_hook_order(system);
     if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         *active = false;
         *generation = 0U;
@@ -7208,6 +7497,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
         return -1;
     }
     system->rules_verified = true;
+    if (system->loaded_config.config.mode == ASTERISKD_MODE_TPROXY) system_warn_hook_order(system);
     if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         *active = false;
         *generation = 0U;
@@ -7601,7 +7891,101 @@ static int system_reset_telemetry_state(
     return ASTERISKD_STATE_OK;
 }
 
+/* Supervisor-death guard. A detached grandchild holds the read end of a pipe;
+ * an orderly supervisor exit writes ASTERISKD_GUARD_ORDERLY_EXIT first, while
+ * a crash or SIGKILL only closes it, and the guard then runs a cleanup-only
+ * pass so Asterisk-owned rules and routes do not outlive the supervisor. */
+static void system_guard_spawn(struct asteriskd_system_supervisor *system,
+    const char *config_path) {
+    int pipe_fds[2] = {-1, -1};
+    if (pipe(pipe_fds) != 0) return;
+    if (fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC) != 0) {
+        (void)close(pipe_fds[0]);
+        (void)close(pipe_fds[1]);
+        return;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        (void)close(pipe_fds[0]);
+        (void)close(pipe_fds[1]);
+        return;
+    }
+    if (child == 0) {
+        pid_t grandchild = fork();
+        if (grandchild != 0) _exit(grandchild < 0 ? 1 : 0);
+        (void)setsid();
+        if (pipe_fds[0] != ASTERISKD_GUARD_PIPE_FD) {
+            if (dup2(pipe_fds[0], ASTERISKD_GUARD_PIPE_FD) < 0) _exit(1);
+        } else if (fcntl(ASTERISKD_GUARD_PIPE_FD, F_SETFD, 0) != 0) {
+            _exit(1);
+        }
+        int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (null_fd < 0) _exit(1);
+        for (int fd = 0; fd < 3; ++fd) {
+            if (dup2(null_fd, fd) < 0) _exit(1);
+        }
+        long max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd < 0 || max_fd > 65536L) max_fd = 65536L;
+        for (int fd = ASTERISKD_GUARD_PIPE_FD + 1; fd < (int)max_fd; ++fd) (void)close(fd);
+        sigset_t empty;
+        sigemptyset(&empty);
+        (void)sigprocmask(SIG_SETMASK, &empty, NULL);
+        for (int signal_number = 1; signal_number < NSIG; ++signal_number) {
+            if (signal_number != SIGKILL && signal_number != SIGSTOP) {
+                (void)signal(signal_number, SIG_DFL);
+            }
+        }
+        /* Survive the app killing the supervisor's process group. */
+        (void)signal(SIGHUP, SIG_IGN);
+        char *const argv[] = {(char *)"asteriskd", (char *)"guard", (char *)"--config",
+            (char *)config_path, NULL};
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+    (void)close(pipe_fds[0]);
+    int wait_status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &wait_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+        (void)close(pipe_fds[1]);
+        return;
+    }
+    system->guard_fd = pipe_fds[1];
+}
+
+static void system_guard_release(struct asteriskd_system_supervisor *system, bool orderly) {
+    if (system->guard_fd < 0) return;
+    const char marker = ASTERISKD_GUARD_ORDERLY_EXIT;
+    ssize_t written;
+    /* A guard that already died must not SIGPIPE the supervisor: block SIGPIPE
+     * around the write and drop one raised by it. */
+    sigset_t pipe_set, previous_mask, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    sigemptyset(&pending);
+    bool masked = sigprocmask(SIG_BLOCK, &pipe_set, &previous_mask) == 0;
+    bool was_pending = masked && sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE);
+    do {
+        written = orderly ? write(system->guard_fd, &marker, 1U) : 0;
+    } while (written < 0 && errno == EINTR);
+    if (masked) {
+        if (!was_pending && written < 0 && errno == EPIPE) {
+            const struct timespec zero = {0, 0};
+            (void)sigtimedwait(&pipe_set, NULL, &zero);
+        }
+        (void)sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+    }
+    (void)close(system->guard_fd);
+    system->guard_fd = -1;
+}
+
 static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
+    /* A teardown that did not reach "stopped" leaves the guard armed so it
+     * retries the cleanup after we exit. */
+    bool orderly = !system->state.initialized || asteriskd_state_is_stopped(&system->state);
     system_runtime_cleanup_cycle(system);
     if (system->control != NULL) {
         asteriskd_control_server_destroy(system->control);
@@ -7625,6 +8009,8 @@ static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
     asteriskd_state_store_close(&system->store);
     if (system->logger.opened) (void)asteriskd_log_close(&system->logger);
     asteriskd_loaded_config_release(&system->loaded_config);
+    /* Last: only after our own teardown finished is the guard told to stand down. */
+    system_guard_release(system, orderly);
 }
 
 static void system_runtime_finish_control_stop(
@@ -7651,8 +8037,122 @@ static void system_runtime_finish_control_stop(
     asteriskd_control_snapshot_destroy(&snapshot);
 }
 
-static int system_runtime_run(const char *config_path, bool initial_start,
+enum system_run_kind {
+    SYSTEM_RUN_START,
+    SYSTEM_RUN_MONITOR,
+    SYSTEM_RUN_CLEANUP,
+};
+
+/* AsteriskMETA fork: append a timestamped plain-text line to logs/error.log so the
+ * core's own stderr and its exit status/signal appear together. Best effort. */
+static void system_append_core_log_line(struct asteriskd_system_supervisor *system, const char *message) {
+    char path[ASTERISKD_MAX_PATH];
+    if (asteriskd_log_sibling_path(system->loaded_config.config.log_path, "error.log",
+            path, sizeof(path)) != 0) return;
+    char error[96U];
+    int fd = -1;
+    if (asteriskd_log_open_append_fd(path, &fd, error, sizeof(error)) != ASTERISKD_LOG_OK || fd < 0) return;
+    char stamp[48U] = "unknown-time";
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) != NULL) (void)strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S%z", &local);
+    char line[384U];
+    int length = snprintf(line, sizeof(line), "[asteriskd %s] %s\n", stamp, message);
+    if (length > 0) {
+        size_t size = (size_t)length < sizeof(line) ? (size_t)length : sizeof(line) - 1U;
+        ssize_t ignored = write(fd, line, size);
+        (void)ignored;
+    }
+    (void)close(fd);
+}
+
+static void system_describe_child_exit(const struct asteriskd_child_exit_status *exit_status,
+    char *buffer, size_t size) {
+    if (exit_status != NULL && exit_status->has_exit_code) {
+        (void)snprintf(buffer, size, "exit_code=%d", exit_status->exit_code);
+    } else if (exit_status != NULL && exit_status->has_signal) {
+        (void)snprintf(buffer, size, "signal=%d", exit_status->signal_number);
+    } else {
+        (void)snprintf(buffer, size, "status=unknown");
+    }
+}
+
+/* Decide whether the cycle that just ended should be restarted automatically.
+ * Returns the backoff delay in milliseconds or -1. Must run before the next
+ * system_runtime_reset_cycle (it reads the per-cycle exit status). */
+static int64_t system_auto_restart_decide(struct asteriskd_system_supervisor *system,
+    int cycle_status, bool cycle_stop_requested) {
+    struct asteriskd_runtime *runtime = system->runtime;
+    enum asteriskd_lifecycle_reason reason = atomic_load_explicit(
+        &runtime->lifecycle.terminal_reason, memory_order_acquire);
+    bool core_exit = reason == ASTERISKD_LIFECYCLE_REASON_CORE_EXITED;
+    bool helper_exit = reason == ASTERISKD_LIFECYCLE_REASON_HELPER_EXITED;
+    if (runtime->cycle_reached_running) {
+        asteriskd_restart_policy_on_running(&system->restart_policy, runtime->cycle_running_since_ms);
+    }
+    int64_t now = 0;
+    if (system_runtime_clock(system, &now) != 0) now = 0;
+    struct asteriskd_restart_cycle_outcome outcome = {
+        .child_exited = cycle_status != 0 && (core_exit || helper_exit),
+        .stop_requested = cycle_stop_requested,
+        .shutdown_requested = system->shutdown_requested,
+        .cleanup_complete = runtime->lifecycle.stopped,
+    };
+    char exit_text[64U];
+    system_describe_child_exit(core_exit ? &system->core_exit : &system->helper_exit,
+        exit_text, sizeof(exit_text));
+    if (core_exit || helper_exit) {
+        char message[256U];
+        (void)snprintf(message, sizeof(message), "%s exited unexpectedly: %s",
+            core_exit ? "core" : "helper", exit_text);
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_append_core_log_line(system, message);
+    }
+    int64_t delay = asteriskd_restart_policy_on_cycle_end(&system->restart_policy, &outcome, now);
+    if (delay >= 0) {
+        char message[256U];
+        (void)snprintf(message, sizeof(message),
+            "automatic restart scheduled in %lld ms (attempt %u, total %u)",
+            (long long)delay, system->restart_policy.attempt, system->restart_policy.total_restarts);
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_append_core_log_line(system, message);
+    } else if (core_exit || helper_exit) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "no automatic restart (stop requested, cleanup incomplete or cold-start failure)");
+    }
+    return delay;
+}
+
+/* Wait for the backoff deadline while still serving control requests.
+ * Returns 0 to keep looping, -1 on a fatal reactor error. */
+static int system_auto_restart_wait(struct asteriskd_system_supervisor *system) {
+    int64_t now = 0;
+    if (system_runtime_clock(system, &now) != 0) return -1;
+    if (asteriskd_restart_policy_due(&system->restart_policy, now)) {
+        system->restart_policy.pending = false;
+        system->service_start_requested = true;
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "automatic core restart: starting a new cycle");
+        system_append_core_log_line(system, "automatic core restart: starting a new cycle");
+        return 0;
+    }
+    struct asteriskd_deadline deadline = {
+        .armed = true,
+        .monotonic_milliseconds = system->restart_policy.restart_at_ms,
+    };
+    struct asteriskd_runtime_delta delta;
+    if (asteriskd_runtime_pump_once(system->runtime, &deadline, &delta) != 0 ||
+        (delta.flags & ASTERISKD_DELTA_FATAL) != 0U) return -1;
+    return 0;
+}
+
+static int system_runtime_run(const char *config_path, enum system_run_kind kind,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
+    bool initial_start = kind == SYSTEM_RUN_START;
     if (has_early_result == NULL || early_result == NULL) return -1;
     *has_early_result = false;
     memset(early_result, 0, sizeof(*early_result));
@@ -7687,6 +8187,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
     system.service_timer_fd = -1;
     system.wifi_monitor.fd = -1;
     system.tc_netlink_fd = -1;
+    system.guard_fd = -1;
     system_child_process_defaults(&system.core_process);
     system_child_process_defaults(&system.helper_process);
     system_child_process_defaults(&system.action_process);
@@ -7706,6 +8207,8 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         return asteriskd_control_result_exit_code(code);
     }
+    /* Cleanup-only: never start the service from schedule/Wi-Fi/keyguard. */
+    if (kind == SYSTEM_RUN_CLEANUP) system.loaded_config.config.service_control.enabled = false;
 
     system.signal_fd = signalfd(-1, &blocked, SFD_NONBLOCK | SFD_CLOEXEC);
     system.signal_fd_owned = system.signal_fd >= 0;
@@ -7851,6 +8354,38 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         return 1;
     }
+    if (kind == SYSTEM_RUN_CLEANUP && system.owned_cleanup_incomplete) {
+        *has_early_result = true;
+        (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+            "cleanup incomplete: owned rules or routes remain; see asteriskd log", NULL);
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return asteriskd_control_result_exit_code(early_result->code);
+    }
+    if (kind == SYSTEM_RUN_CLEANUP) {
+        *has_early_result = true;
+        asteriskd_control_result_destroy(early_result);
+        early_result->code = ASTERISKD_CONTROL_RESULT_OK;
+        if (asteriskd_control_snapshot_from_state(
+                &system.state, &system.live, &early_result->snapshot) == 0) {
+            early_result->has_snapshot = true;
+        } else {
+            (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+                "cleanup finished but the snapshot is unavailable", NULL);
+        }
+        (void)asteriskd_log_line(&system.logger, ASTERISKD_LOG_LEVEL_INFO,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "cleanup-only pass finished");
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return asteriskd_control_result_exit_code(early_result->code);
+    }
+    system_guard_spawn(&system, config_path);
+    if (system.guard_fd < 0) {
+        (void)asteriskd_log_line(&system.logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "supervisor-death guard unavailable; an unclean exit needs `asteriskd cleanup`");
+    }
     asteriskd_control_server_enable_accepting(system.control, true);
     struct asteriskd_runtime_effect_backend effects = system_runtime_effects(&system);
     int status = 0;
@@ -7873,21 +8408,34 @@ static int system_runtime_run(const char *config_path, bool initial_start,
             int cycle_status = asteriskd_runtime_supervise(
                 system.runtime, &system.loaded_config.config,
                 &system.state, &system.live, &effects);
+            bool cycle_stop_requested = system.manual_stop_pending || system.stop_requested ||
+                system.automatic_stop_pending;
             system.service_running = false;
             system.manual_stop_pending = false;
             asteriskd_service_control_set_service_running(
                 &system.service_control, system.service_start_requested);
             system_runtime_finish_control_stop(&system);
-            if (cycle_status != 0) {
+            int64_t restart_delay = system_auto_restart_decide(
+                &system, cycle_status, cycle_stop_requested);
+            if (cycle_status != 0 && restart_delay < 0) {
                 if (cycle_failure_requires_shutdown(
                         service->enabled, system.runtime->lifecycle.stopped)) {
                     status = cycle_status;
                     system.shutdown_requested = true;
                 }
             }
+            if (restart_delay >= 0 && !system.shutdown_requested) continue;
             if (!service->enabled) break;
             if (system.shutdown_requested) break;
             if (system_service_reconcile_time(&system) != 0) {
+                status = 1;
+                system.shutdown_requested = true;
+            }
+            continue;
+        }
+        if (system.restart_policy.pending) {
+            int auto_restart = system_auto_restart_wait(&system);
+            if (auto_restart < 0) {
                 status = 1;
                 system.shutdown_requested = true;
             }
@@ -7928,12 +8476,17 @@ static int system_runtime_run(const char *config_path, bool initial_start,
 
 int asteriskd_runtime_start_system(const char *config_path,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
-    return system_runtime_run(config_path, true, has_early_result, early_result);
+    return system_runtime_run(config_path, SYSTEM_RUN_START, has_early_result, early_result);
 }
 
 int asteriskd_runtime_monitor_system(const char *config_path,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
-    return system_runtime_run(config_path, false, has_early_result, early_result);
+    return system_runtime_run(config_path, SYSTEM_RUN_MONITOR, has_early_result, early_result);
+}
+
+int asteriskd_runtime_cleanup_system(const char *config_path,
+    bool *has_early_result, struct asteriskd_control_result *early_result) {
+    return system_runtime_run(config_path, SYSTEM_RUN_CLEANUP, has_early_result, early_result);
 }
 
 #endif
