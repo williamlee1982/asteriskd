@@ -2051,6 +2051,32 @@ int asteriskd_runtime_cleanup_system(
 bool asteriskd_test_cycle_failure_requires_shutdown(bool, bool);
 #endif
 
+/* AsteriskMETA fork: supervised auto-restart of an unexpectedly exited core. */
+#define ASTERISKD_RESTART_STABLE_UPTIME_MS 60000
+struct asteriskd_restart_policy {
+    unsigned int attempt;
+    unsigned int total_restarts;
+    bool chain_active;
+    bool pending;
+    bool has_running_since;
+    int64_t running_since_ms;
+    int64_t restart_at_ms;
+};
+struct asteriskd_restart_cycle_outcome {
+    bool child_exited;       /* the cycle ended because the core or helper exited */
+    bool stop_requested;     /* explicit stop/shutdown/signal latched for the cycle */
+    bool shutdown_requested; /* supervisor is going away */
+    bool cleanup_complete;   /* the lifecycle tore everything down */
+};
+void asteriskd_restart_policy_init(struct asteriskd_restart_policy *);
+void asteriskd_restart_policy_on_running(struct asteriskd_restart_policy *, int64_t);
+void asteriskd_restart_policy_cancel(struct asteriskd_restart_policy *);
+int64_t asteriskd_restart_policy_backoff_ms(unsigned int);
+/* Returns the delay before the next start, or -1 when the supervisor must not restart. */
+int64_t asteriskd_restart_policy_on_cycle_end(
+    struct asteriskd_restart_policy *, const struct asteriskd_restart_cycle_outcome *, int64_t);
+bool asteriskd_restart_policy_due(const struct asteriskd_restart_policy *, int64_t);
+
 enum asteriskd_control_backend_result {
     ASTERISKD_CONTROL_BACKEND_OK = 0,
     ASTERISKD_CONTROL_BACKEND_ERROR = -1,

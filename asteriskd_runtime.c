@@ -48,6 +48,9 @@ struct asteriskd_runtime {
     struct asteriskd_runtime_delta pending_delta;
     bool supervising;
     bool starting_event_published;
+    /* AsteriskMETA fork: whether this cycle reached the running phase and when. */
+    bool cycle_reached_running;
+    int64_t cycle_running_since_ms;
 };
 
 void asteriskd_poll_builder_init(struct asteriskd_poll_builder *builder) {
@@ -819,6 +822,8 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
     runtime->effects = effects;
     runtime->supervising = true;
     runtime->starting_event_published = false;
+    runtime->cycle_reached_running = false;
+    runtime->cycle_running_since_ms = 0;
     asteriskd_runtime_delta_init(&runtime->pending_delta);
     struct asteriskd_lifecycle_options options = {
         .has_helper = config->helper.type != ASTERISKD_HELPER_NONE,
@@ -846,6 +851,13 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         int result = runtime_finish(runtime, reason, &startup_failure);
         runtime->supervising = false;
         return result == 0 ? 1 : result;
+    }
+    {
+        int64_t running_since = 0;
+        if (runtime->backend.monotonic_milliseconds(runtime->backend_context, &running_since) == 0) {
+            runtime->cycle_reached_running = true;
+            runtime->cycle_running_since_ms = running_since;
+        }
     }
 
     int result = 0;
@@ -1100,6 +1112,8 @@ struct asteriskd_system_supervisor {
     bool dns_regenerating, dns_drain_waiting;
     int dns_hot_stage, dns_hot_result;
     struct asteriskd_control_request dns_hot_request;
+    /* AsteriskMETA fork: survives system_runtime_reset_cycle (declared before stop_requested). */
+    struct asteriskd_restart_policy restart_policy;
     bool stop_requested;
     /* Per-cycle TPROXY capability preflight result. Unknown => upstream behaviour. */
     bool tproxy_capabilities_known;
@@ -1297,12 +1311,14 @@ static void system_service_apply_action(
             system->automatic_stop_pending = false;
         }
     } else if (action == ASTERISKD_SERVICE_ACTION_STOP) {
+        asteriskd_restart_policy_cancel(&system->restart_policy);
         system->service_start_requested = false;
         if (system->service_running) {
             system->stop_requested = true;
             system->automatic_stop_pending = true;
         }
     } else if (action == ASTERISKD_SERVICE_ACTION_SHUTDOWN) {
+        asteriskd_restart_policy_cancel(&system->restart_policy);
         system->shutdown_requested = true;
         if (system->service_running) system->stop_requested = true;
     }
@@ -1862,7 +1878,18 @@ static int system_runtime_snapshot(
 
 static int system_runtime_request_stop(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (!system->runtime->supervising) return 1;
+    if (!system->runtime->supervising) {
+        /* An explicit stop always wins over a pending automatic core restart. */
+        if (system->restart_policy.pending) {
+            asteriskd_restart_policy_cancel(&system->restart_policy);
+            system->service_start_requested = false;
+            if (!system->loaded_config.config.service_control.enabled) system->shutdown_requested = true;
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+                ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+                "pending automatic core restart cancelled by explicit stop");
+        }
+        return 1;
+    }
     system->stop_requested = true;
     system->automatic_stop_pending = false;
     system->manual_stop_pending = true;
@@ -1872,6 +1899,7 @@ static int system_runtime_request_stop(void *opaque) {
 
 static int system_runtime_request_shutdown(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
+    asteriskd_restart_policy_cancel(&system->restart_policy);
     system->shutdown_requested = true;
     system->service_start_requested = false;
     if (system->runtime->supervising) {
@@ -8015,6 +8043,113 @@ enum system_run_kind {
     SYSTEM_RUN_CLEANUP,
 };
 
+/* AsteriskMETA fork: append a timestamped plain-text line to logs/error.log so the
+ * core's own stderr and its exit status/signal appear together. Best effort. */
+static void system_append_core_log_line(struct asteriskd_system_supervisor *system, const char *message) {
+    char path[ASTERISKD_MAX_PATH];
+    if (asteriskd_log_sibling_path(system->loaded_config.config.log_path, "error.log",
+            path, sizeof(path)) != 0) return;
+    char error[96U];
+    int fd = -1;
+    if (asteriskd_log_open_append_fd(path, &fd, error, sizeof(error)) != ASTERISKD_LOG_OK || fd < 0) return;
+    char stamp[48U] = "unknown-time";
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) != NULL) (void)strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S%z", &local);
+    char line[384U];
+    int length = snprintf(line, sizeof(line), "[asteriskd %s] %s\n", stamp, message);
+    if (length > 0) {
+        size_t size = (size_t)length < sizeof(line) ? (size_t)length : sizeof(line) - 1U;
+        ssize_t ignored = write(fd, line, size);
+        (void)ignored;
+    }
+    (void)close(fd);
+}
+
+static void system_describe_child_exit(const struct asteriskd_child_exit_status *exit_status,
+    char *buffer, size_t size) {
+    if (exit_status != NULL && exit_status->has_exit_code) {
+        (void)snprintf(buffer, size, "exit_code=%d", exit_status->exit_code);
+    } else if (exit_status != NULL && exit_status->has_signal) {
+        (void)snprintf(buffer, size, "signal=%d", exit_status->signal_number);
+    } else {
+        (void)snprintf(buffer, size, "status=unknown");
+    }
+}
+
+/* Decide whether the cycle that just ended should be restarted automatically.
+ * Returns the backoff delay in milliseconds or -1. Must run before the next
+ * system_runtime_reset_cycle (it reads the per-cycle exit status). */
+static int64_t system_auto_restart_decide(struct asteriskd_system_supervisor *system,
+    int cycle_status, bool cycle_stop_requested) {
+    struct asteriskd_runtime *runtime = system->runtime;
+    enum asteriskd_lifecycle_reason reason = atomic_load_explicit(
+        &runtime->lifecycle.terminal_reason, memory_order_acquire);
+    bool core_exit = reason == ASTERISKD_LIFECYCLE_REASON_CORE_EXITED;
+    bool helper_exit = reason == ASTERISKD_LIFECYCLE_REASON_HELPER_EXITED;
+    if (runtime->cycle_reached_running) {
+        asteriskd_restart_policy_on_running(&system->restart_policy, runtime->cycle_running_since_ms);
+    }
+    int64_t now = 0;
+    if (system_runtime_clock(system, &now) != 0) now = 0;
+    struct asteriskd_restart_cycle_outcome outcome = {
+        .child_exited = cycle_status != 0 && (core_exit || helper_exit),
+        .stop_requested = cycle_stop_requested,
+        .shutdown_requested = system->shutdown_requested,
+        .cleanup_complete = runtime->lifecycle.stopped,
+    };
+    char exit_text[64U];
+    system_describe_child_exit(core_exit ? &system->core_exit : &system->helper_exit,
+        exit_text, sizeof(exit_text));
+    if (core_exit || helper_exit) {
+        char message[256U];
+        (void)snprintf(message, sizeof(message), "%s exited unexpectedly: %s",
+            core_exit ? "core" : "helper", exit_text);
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_append_core_log_line(system, message);
+    }
+    int64_t delay = asteriskd_restart_policy_on_cycle_end(&system->restart_policy, &outcome, now);
+    if (delay >= 0) {
+        char message[256U];
+        (void)snprintf(message, sizeof(message),
+            "automatic restart scheduled in %lld ms (attempt %u, total %u)",
+            (long long)delay, system->restart_policy.attempt, system->restart_policy.total_restarts);
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_append_core_log_line(system, message);
+    } else if (core_exit || helper_exit) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "no automatic restart (stop requested, cleanup incomplete or cold-start failure)");
+    }
+    return delay;
+}
+
+/* Wait for the backoff deadline while still serving control requests.
+ * Returns 0 to keep looping, -1 on a fatal reactor error. */
+static int system_auto_restart_wait(struct asteriskd_system_supervisor *system) {
+    int64_t now = 0;
+    if (system_runtime_clock(system, &now) != 0) return -1;
+    if (asteriskd_restart_policy_due(&system->restart_policy, now)) {
+        system->restart_policy.pending = false;
+        system->service_start_requested = true;
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "automatic core restart: starting a new cycle");
+        system_append_core_log_line(system, "automatic core restart: starting a new cycle");
+        return 0;
+    }
+    struct asteriskd_deadline deadline = {
+        .armed = true,
+        .monotonic_milliseconds = system->restart_policy.restart_at_ms,
+    };
+    struct asteriskd_runtime_delta delta;
+    if (asteriskd_runtime_pump_once(system->runtime, &deadline, &delta) != 0 ||
+        (delta.flags & ASTERISKD_DELTA_FATAL) != 0U) return -1;
+    return 0;
+}
+
 static int system_runtime_run(const char *config_path, enum system_run_kind kind,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
     bool initial_start = kind == SYSTEM_RUN_START;
@@ -8273,21 +8408,34 @@ static int system_runtime_run(const char *config_path, enum system_run_kind kind
             int cycle_status = asteriskd_runtime_supervise(
                 system.runtime, &system.loaded_config.config,
                 &system.state, &system.live, &effects);
+            bool cycle_stop_requested = system.manual_stop_pending || system.stop_requested ||
+                system.automatic_stop_pending;
             system.service_running = false;
             system.manual_stop_pending = false;
             asteriskd_service_control_set_service_running(
                 &system.service_control, system.service_start_requested);
             system_runtime_finish_control_stop(&system);
-            if (cycle_status != 0) {
+            int64_t restart_delay = system_auto_restart_decide(
+                &system, cycle_status, cycle_stop_requested);
+            if (cycle_status != 0 && restart_delay < 0) {
                 if (cycle_failure_requires_shutdown(
                         service->enabled, system.runtime->lifecycle.stopped)) {
                     status = cycle_status;
                     system.shutdown_requested = true;
                 }
             }
+            if (restart_delay >= 0 && !system.shutdown_requested) continue;
             if (!service->enabled) break;
             if (system.shutdown_requested) break;
             if (system_service_reconcile_time(&system) != 0) {
+                status = 1;
+                system.shutdown_requested = true;
+            }
+            continue;
+        }
+        if (system.restart_policy.pending) {
+            int auto_restart = system_auto_restart_wait(&system);
+            if (auto_restart < 0) {
                 status = 1;
                 system.shutdown_requested = true;
             }

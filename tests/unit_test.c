@@ -272,6 +272,90 @@ static void test_tproxy_readiness_requires_udp(void) {
     CHECK(asteriskd_readiness_poll(&config, &tracker, &identity, &backend, 1U, false) == ASTERISKD_READINESS_PENDING);
 }
 
+/* ---- AsteriskMETA fork: automatic core restart policy ---------------- */
+static struct asteriskd_restart_cycle_outcome core_crash(void) {
+    struct asteriskd_restart_cycle_outcome o = {
+        .child_exited = true, .stop_requested = false,
+        .shutdown_requested = false, .cleanup_complete = true,
+    };
+    return o;
+}
+
+static void test_restart_policy_backoff_sequence(void) {
+    struct asteriskd_restart_policy p;
+    asteriskd_restart_policy_init(&p);
+    struct asteriskd_restart_cycle_outcome o = core_crash();
+    int64_t now = 1000;
+    asteriskd_restart_policy_on_running(&p, now);
+    now += 5000; /* crashed after 5 s: not stable */
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, now) == 1000);
+    CHECK(p.pending && p.restart_at_ms == now + 1000);
+    CHECK(!asteriskd_restart_policy_due(&p, now + 999));
+    CHECK(asteriskd_restart_policy_due(&p, now + 1000));
+    /* Restarted cycles that fail before running stay in the chain. */
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, now += 1000) == 2000);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, now += 2000) == 5000);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, now += 5000) == 10000);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, now += 10000) == 30000);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, now += 30000) == 30000); /* capped */
+    CHECK(p.total_restarts == 6U);
+}
+
+static void test_restart_policy_resets_after_stable_uptime(void) {
+    struct asteriskd_restart_policy p;
+    asteriskd_restart_policy_init(&p);
+    struct asteriskd_restart_cycle_outcome o = core_crash();
+    asteriskd_restart_policy_on_running(&p, 0);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == 1000);
+    asteriskd_restart_policy_on_running(&p, 2000);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 3000) == 2000);
+    asteriskd_restart_policy_on_running(&p, 10000);
+    /* ran >= 60 s before crashing again: back to the first step */
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 10000 + ASTERISKD_RESTART_STABLE_UPTIME_MS) == 1000);
+}
+
+static void test_restart_policy_never_fights_explicit_stop(void) {
+    struct asteriskd_restart_policy p;
+    asteriskd_restart_policy_init(&p);
+    struct asteriskd_restart_cycle_outcome o = core_crash();
+    o.stop_requested = true;
+    asteriskd_restart_policy_on_running(&p, 0);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == -1);
+    CHECK(!p.pending && !p.chain_active);
+    o = core_crash();
+    o.shutdown_requested = true;
+    asteriskd_restart_policy_on_running(&p, 0);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == -1);
+    o = core_crash();
+    o.cleanup_complete = false; /* incomplete teardown must stop the supervisor */
+    asteriskd_restart_policy_on_running(&p, 0);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == -1);
+    o = core_crash();
+    o.child_exited = false; /* clean stop or other failure */
+    asteriskd_restart_policy_on_running(&p, 0);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == -1);
+}
+
+static void test_restart_policy_cold_start_failure_not_retried(void) {
+    struct asteriskd_restart_policy p;
+    asteriskd_restart_policy_init(&p);
+    struct asteriskd_restart_cycle_outcome o = core_crash();
+    /* never reached running and no active chain: a broken config is not retried */
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == -1);
+}
+
+static void test_restart_policy_cancel_clears_pending(void) {
+    struct asteriskd_restart_policy p;
+    asteriskd_restart_policy_init(&p);
+    struct asteriskd_restart_cycle_outcome o = core_crash();
+    asteriskd_restart_policy_on_running(&p, 0);
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == 1000);
+    asteriskd_restart_policy_cancel(&p);
+    CHECK(!p.pending && !asteriskd_restart_policy_due(&p, 1000000));
+    /* after a cancel the next cold-start failure is not part of a chain */
+    CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 200) == -1);
+}
+
 int main(void) {
     static const struct test_case cases[] = {
         {"tcp_listen_in_local_column", test_tcp_listen_in_local_column},
@@ -293,6 +377,11 @@ int main(void) {
         {"cli_cleanup_and_guard_parse", test_cli_cleanup_and_guard_parse},
         {"tproxy_readiness_requires_udp", test_tproxy_readiness_requires_udp},
         {"guard_decision", test_guard_decision},
+        {"restart_policy_backoff_sequence", test_restart_policy_backoff_sequence},
+        {"restart_policy_resets_after_stable_uptime", test_restart_policy_resets_after_stable_uptime},
+        {"restart_policy_never_fights_explicit_stop", test_restart_policy_never_fights_explicit_stop},
+        {"restart_policy_cold_start_failure_not_retried", test_restart_policy_cold_start_failure_not_retried},
+        {"restart_policy_cancel_clears_pending", test_restart_policy_cancel_clears_pending},
     };
     return run_tests("unit", cases, sizeof(cases) / sizeof(cases[0]));
 }
