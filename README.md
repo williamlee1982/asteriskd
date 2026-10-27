@@ -6,19 +6,49 @@ matcher, daemon-managed routing/firewall/BPF/TC state, in-memory effect journal,
 reconciliation, structured log, and the local control socket for the whole
 runtime lifetime.
 
-The supervisor does not daemonize and does not restart a failed child. A core or
-required-helper exit causes a fail-stop: new traffic entry is removed first,
-owned effects are cleaned in reverse order, and a non-resident supervisor exits
-nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
+The supervisor does not daemonize. On this fork, a core or required-helper exit
+after the cycle reached running is torn down and started again after
+1s/2s/5s/10s/30s (capped). The backoff resets after 60s of stable uptime.
+Explicit stop, shutdown, SIGTERM/SIGINT, service-control stop and incomplete
+cleanup never restart, and a stop during the backoff cancels it. A cold-start
+failure outside an active restart chain is not retried. Upstream v2.2.2 itself
+fail-stops. A clean explicit stop succeeds only after telemetry reaches `stopped`.
+`start` and `monitor` also spawn a detached `asteriskd guard` that runs
+`cleanup` if the supervisor dies without an orderly teardown.
 
 The source root is build-system agnostic. The Android parent project compiles
-every top-level `.c` file as one PIE executable.
+every `.c` file under the root and its module directories as one PIE executable,
+with the source root on the include path (`-I<root>`).
+
+## Source layout
+
+| Path | Responsibility |
+| --- | --- |
+| `asteriskd.c`, `asteriskd.h` | CLI entry point; the shared module interface |
+| `runtime/` | `control.c` control protocol, socket server and CLI client; `runtime.c` platform-neutral reactor, lifecycle driver and event publication; `lifecycle.c` start, stop and pause sequencing of the core, helper and matcher |
+| `core/` | Configuration parsing, JSON, structured log, state telemetry, error/string/text helpers, platform capabilities, the Linux system backends |
+| `process/` | Core, helper and matcher process specs, child setup, readiness and stop coordination |
+| `resources/` | Owned-resource catalog, stateless reconciliation, the in-memory effect journal, BPF map/pin/matcher/bpf2socks verification |
+| `rules/` | Rule plans for TPROXY, TUN, local bypass and runtime slots, rule batches, TC install plans and netlink, TUN compatibility |
+| `network/` | Network reconciliation, hotspot offload policy, the AEN1 DNS companion client |
+| `service/` | Service control: Wi-Fi rules, schedules (cron) and the lock screen (keyguard) listener |
+| `supervisor/` | Linux supervisor: reactor backend, children, cleanup, death guard and auto-restart (`supervisor.c`); restart backoff (`restart_policy.c`); TPROXY capability preflight (`tproxy_preflight.c`); root actions and `iptables-restore --noflush` batches (`supervisor_action.c`); rtnetlink rules/routes and the tethering offload probe (`supervisor_rtnl.c`); iptables rendering and snapshots (`supervisor_xtables.c`); TC (`supervisor_tc.c`); routes, BPF pins and sysctl (`supervisor_rules.c`); matcher/helper start, network open and hotspot offload (`supervisor_network.c`); owned-resource reconciliation (`supervisor_reconcile.c`); DNS enhancement transitions (`supervisor_dns.c`) |
+| `shared/` | Contracts kept byte-identical with bpf2socks |
+
+`asteriskd.h` is the shared module interface. `supervisor/supervisor.h` is private
+to the runtime and supervisor modules. Every project include names its header from
+the source root, for example `#include "supervisor/supervisor.h"`. Non-static
+functions use the `asteriskd_<module>_` prefix; file-local helpers carry the module
+name without it (`control_`, `config_`), and those in supervisor modules use
+`system_`. `.clang-format` records the formatting baseline.
 
 ## CLI
 
 ```text
 asteriskd start --config ABSOLUTE_PATH
 asteriskd monitor --config ABSOLUTE_PATH
+asteriskd cleanup --config ABSOLUTE_PATH
+asteriskd guard --config ABSOLUTE_PATH
 asteriskd status
 asteriskd stop
 asteriskd shutdown
@@ -31,6 +61,9 @@ cycle while keeping the supervisor available for configured service actions;
 `shutdown` also exits the supervisor after the active service has stopped.
 `start` launches the supervisor and immediately starts a service cycle;
 `monitor` launches it idle and waits for configured service-control actions.
+`cleanup` removes Asterisk-owned resources without starting a cycle.
+`guard` is the detached death-guard entry: it waits on the supervisor pipe
+and runs `cleanup` only when the supervisor did not exit orderly.
 `watch` writes an initial response and then JSON event lines until the final
 event or disconnect. CLI usage errors write only to stderr and exit 64.
 
@@ -86,9 +119,12 @@ environment, and configuration content are never exposed.
 
 Android 13+ can enable `serviceControl.keyguard`: `enabled`, `lockStart`,
 `lockStop`, `unlockStart`, and `unlockStop`. Start/stop for the same event are
-mutually exclusive. Initial state establishes a baseline; duplicate state
-notifications do not trigger actions. This follows Keyguard showing/dismissed
-state, not display power or credential-storage unlock.
+mutually exclusive. The initial query validates initialization without triggering
+an action or seeding callback deduplication: `isKeyguardLocked()` can differ from
+the listener's showing state when another app temporarily disables the keyguard.
+The first callback after priming is eligible for an action; later callbacks that
+repeat the last callback value do not trigger actions. This follows Keyguard
+showing/dismissed state, not display power or credential-storage unlock.
 
 The native supervisor loads `libbinder_ndk` only when this control is enabled,
 registers a WindowManager listener, and adds the Binder fd to its existing
@@ -120,7 +156,9 @@ Top-level sections are:
 - `core` for the readiness timeout and optional Mihomo AGE secret;
 - `modeOptions` for the tproxy port or TUN name;
 - `network` for IPv6 intent, DNS/fake-DNS, interface selectors, private CIDRs,
-  UID policy, and inline canonical direct CIDRs;
+  UID policy, and inline canonical direct CIDRs. Optional booleans
+  `captureBoundNetworks` and `blockEncryptedDns` may be omitted; absence means
+  false and matches upstream v2.2.2;
 - nullable `helper` (`hev-socks5-tunnel` or `bpf2socks`);
 - nullable `matcher`, containing only its executable path.
 
@@ -173,6 +211,7 @@ port, and the bpf2socks helper waits for its bridge port. Port checks
 search for the four-digit hexadecimal port
 marker in /proc/<child-pid>/net/tcp6, then tcp. They do not filter TCP state
 or local versus remote ports, and read failures remain pending until timeout.
+Checks run on every reactor event and at least every 20 ms.
 Socket ownership and process-group file descriptors are not inspected. Native TUN
 and the HEV helper wait for the named interface. BOX `ebpf` requires the core
 to survive a fixed 1000 ms window and does not wait for a shared interface.
@@ -190,15 +229,48 @@ operator or a later normal service action to handle.
 One reactor owns signals, control clients, child setup/log/pidfd events,
 route-netlink input, debounce deadlines, readiness, action commands, and stop
 deadlines. Netlink subscribes before the initial snapshot, drains to `EAGAIN`,
-and performs a full reconcile after the 1500 ms trailing debounce or any
-integrity loss. System-IPv6 disablement records original values only in the
-resident supervisor's in-memory effect journal.
+and performs a full reconcile for routing changes after the 1500 ms trailing
+debounce or any integrity loss. Events used only by the system IPv6 guard do
+not schedule a full rules reconcile.
+
+`disableSystemIpv6` disables IPv6 only on netd data networks available to
+ordinary applications. The guard identifies them from IPv6 FIB rules: a global
+explicit-network fwmark rule with a nonzero netId, permission `NONE`, and no UID
+range, plus an `oif` rule for the same table. The table must be in the range
+`1000 < table < 1000000000`, and `table - 1000` must equal the named interface's
+ifindex when entering the guarded set. Classification does not
+depend on rule priority or interface-name prefixes. Restricted `NETWORK` or
+`SYSTEM` networks, including IMS, emergency and background networks, remain
+untouched, as do interfaces outside netd's data-network set, including the
+core's TUN. Loopback and `ipsec+` interfaces are always excluded.
+
+The existing netlink socket watches IPv6 rule changes. Startup obtains one
+`RTM_GETRULE` snapshot through a separate socket with a one-second receive
+timeout; integrity loss or a socket reopen requests another snapshot after
+pending events drain. There is no polling or child process for classification.
+Rule membership is deduplicated by identity, so a snapshot and a queued event
+for the same rule do not count it twice. Interrupted dumps preserve the previous
+set and report a sync failure.
+Entering the data-network set disables IPv6. Link and IPv6 address events
+reapply the guard only to interfaces whose name and ifindex match that set, including when
+Android re-enables IPv6. Pending disable/restore requests for the same
+interface use the latest requested state.
+
+Original `disable_ipv6` values exist only in the resident supervisor's
+in-memory effect journal. Leaving the data-network set, including a change to
+restricted permission, restores the recorded value so a persistent cellular
+interface can be reused by IMS. Graceful cleanup also restores recorded values.
+A vanished interface is skipped on apply and its journal entry is discarded
+on restore. A failed restore logs a warning and remains journaled for graceful
+cleanup to retry; no value is recovered from disk after a crash. Startup logs
+the detected network classifications, and guard changes log the interface
+whose IPv6 was disabled or restored.
 
 The daemon is the only writer of `asteriskd.log`. It opens the file through a
 no-symlink path, anchors ownership to the pre-existing app-owned log directory,
-forces mode 0600, and emits bounded JSONL. Child stdout/stderr are framed,
-UTF-8-repaired, control-escaped, truncated at the fixed limit, and redacted for
-the exact AGE secret before persistence.
+forces mode 0600, and emits bounded JSONL with the exact AGE secret redacted.
+Core and bpf2socks helper stdout/stderr are appended directly to `error.log`;
+matcher and HEV helper output is discarded.
 
 The only persistent runtime artifacts are the app-published core config and
 `asteriskd.json`, daemon-owned telemetry file `asteriskd.state`, app-owned
@@ -213,7 +285,7 @@ unmarked DNS, including resolver-owned sockets, follows ordinary traffic policy.
 The DNS-specific OUTPUT rules do not
 expand the application UID list.
 
-`asteriskd_marks.h` defines the numeric marks and their xtables match strings.
+`rules/marks.h` defines the numeric marks and their xtables match strings.
 The classified bit is reserved for enhancement DNS decisions. The module sets
 proxy mark `0x21000000` before the first route lookup. OUTPUT returns both proxy
 and direct decisions through one classified-bit rule per protocol. The fixed
@@ -228,8 +300,9 @@ including UID selection, CIDR and interface bypasses, matcher decisions, and the
 IPv6 switch. They do not receive a separate DNS classification or an exemption
 from address bypasses. Marked system DNS retains its dedicated routing path even
 when ordinary IPv6 proxying is disabled. Core identity bypasses and the existing
-hotspot DNS policy remain in effect. Disabling system IPv6 also disables its
-DNS transport; this differs from disabling ordinary IPv6 proxying.
+hotspot DNS policy remain in effect. Disabling system IPv6 also disables IPv6
+DNS transport on guarded data networks; this differs from disabling ordinary
+IPv6 proxying.
 
 Startup and resume verify consumers, installed rules, and the module
 PREPARE/ACTIVATE exchange. They do not send synthetic DNS queries or inject
@@ -238,12 +311,11 @@ and prepared again within a bounded startup window. The legacy mode is unchanged
 
 ## Verification and device boundary
 
-Host tests use explicit fake backends and compile with
-`-Wall -Wextra -Werror -std=c17`. Production sources must also compile for
-Android API 24 on arm64-v8a, armeabi-v7a, x86, and x86_64. Host tests cannot
-prove rooted-device SELinux, abstract-UDS peer credentials, inherited OFD
-locking, `/proc` identity races, netlink/BPF/TC kernel ABI, or filesystem label
-behavior; those remain mandatory device integration checks.
+Production sources compile with `-Wall -Wextra -std=c17` for Android API 26 on
+arm64-v8a, armeabi-v7a, x86, and x86_64. Compilation cannot prove rooted-device
+SELinux, abstract-UDS peer credentials, inherited OFD locking, `/proc` identity
+races, netlink/BPF/TC kernel ABI, or filesystem label behavior; those remain
+mandatory device integration checks.
 
 ## License
 

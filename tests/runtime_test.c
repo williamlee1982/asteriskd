@@ -1,11 +1,13 @@
 // Copyright 2026, AsteriskMETA contributors
 // SPDX-License-Identifier: GPL-3.0
 //
-// Exercises the real TPROXY command emitter in asteriskd_runtime.c against a
-// fake command backend: rule commands are captured from the rule batch and
-// ip/iptables reads are answered by test_action_hook.
-#include "../asteriskd_runtime.c"
+// Exercises the real TPROXY rule emitter against the iptables-restore batch
+// and a fake rtnetlink ip hook (upstream no longer shells out to ip/iptables
+// for these paths).
+#include "supervisor/supervisor.h"
 #include "test_support.h"
+
+#include <signal.h>
 
 static struct asteriskd_system_supervisor *test_system;
 
@@ -36,11 +38,17 @@ static void add_cidr(char (*list)[ASTERISKD_MAX_CIDR], size_t *count, const char
     ++*count;
 }
 
-static const char *batch_text(struct asteriskd_system_supervisor *system) {
-    struct system_text_batch *batch = &system->rule_commands.xtables_before_ip;
-    if (system_text_batch_append_byte(batch, '\0') != 0) return "";
-    batch->length--;
-    return (const char *)batch->bytes;
+static char batch_storage[65536];
+
+static const char *batch_text(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family) {
+    struct asteriskd_byte_buffer *batch =
+        &system->rule_commands.xtables[0][family][ASTERISKD_IP_TABLE_MANGLE];
+    size_t length = batch->bytes == NULL ? 0U : batch->length;
+    if (length >= sizeof(batch_storage)) length = sizeof(batch_storage) - 1U;
+    if (length != 0U) memcpy(batch_storage, batch->bytes, length);
+    batch_storage[length] = '\0';
+    return batch_storage;
 }
 
 static const char *populate(struct asteriskd_system_supervisor *system,
@@ -50,12 +58,12 @@ static const char *populate(struct asteriskd_system_supervisor *system,
     group.family = family;
     group.table = ASTERISKD_IP_TABLE_MANGLE;
     group.chain_id = ASTERISKD_CHAIN_TPROXY;
-    CHECK(system_populate_private_chain(system, &group, chain) == 0);
-    return batch_text(system);
+    CHECK(asteriskd_test_populate_private_chain(system, &group, chain) == 0);
+    return batch_text(system, family);
 }
 
 static void free_system(struct asteriskd_system_supervisor *system) {
-    system_rule_batch_destroy(&system->rule_commands);
+    asteriskd_supervisor_rule_batch_destroy(&system->rule_commands);
     free(system);
 }
 
@@ -69,9 +77,9 @@ static void test_tailnet_bypass_order_output(void) {
     add_cidr(c->bypass_private_cidrs, &c->bypass_private_cidr_count, "100.64.0.0/10");
     add_cidr(c->bypass_private_cidrs, &c->bypass_private_cidr_count, "192.168.0.0/16");
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
-    long proxied = text_index(text, "'-d' '100.100.100.100/32' '-p' 'tcp'");
-    long bypass = text_index(text, "'-d' '100.64.0.0/10' '-j' 'RETURN'");
-    long catch_all = text_index(text, "'-A' 'ASTERISK_TPROXY_OUTPUT' '-p' 'tcp' '-j' 'MARK'");
+    long proxied = text_index(text, "-d 100.100.100.100/32 -p tcp");
+    long bypass = text_index(text, "-d 100.64.0.0/10 -j RETURN");
+    long catch_all = text_index(text, "-A ASTERISK_TPROXY_OUTPUT -p tcp -j MARK");
     CHECK(proxied >= 0);
     CHECK(bypass > proxied);
     CHECK(catch_all > bypass);
@@ -84,9 +92,9 @@ static void test_tailnet_bypass_order_prerouting(void) {
     add_cidr(c->proxy_private_cidrs, &c->proxy_private_cidr_count, "100.100.100.100/32");
     add_cidr(c->bypass_private_cidrs, &c->bypass_private_cidr_count, "100.64.0.0/10");
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_PREROUTING");
-    long proxied = text_index(text, "'-d' '100.100.100.100/32' '-p' 'udp' '-m' 'mark'");
-    long bypass = text_index(text, "'-d' '100.64.0.0/10' '-j' 'RETURN'");
-    long catch_all = text_index(text, "'-A' 'ASTERISK_TPROXY_PREROUTING' '-p' 'tcp' '-m' 'mark'");
+    long proxied = text_index(text, "-d 100.100.100.100/32 -p udp -m mark");
+    long bypass = text_index(text, "-d 100.64.0.0/10 -j RETURN");
+    long catch_all = text_index(text, "-A ASTERISK_TPROXY_PREROUTING -p tcp -m mark");
     CHECK(proxied >= 0);
     CHECK(bypass > proxied);
     CHECK(catch_all > bypass);
@@ -118,9 +126,9 @@ static void test_tailnet_fixture_from_app_encoder(void) {
     struct asteriskd_system_supervisor *s = system_from_fixture("fixtures/tailnet-tproxy.json");
     CHECK(s->loaded_config.config.mode == ASTERISKD_MODE_TPROXY);
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
-    long proxied = text_index(text, "'-d' '100.101.102.103/32' '-p' 'tcp'");
-    long bypass = text_index(text, "'-d' '100.64.0.0/10' '-j' 'RETURN'");
-    long catch_all = text_index(text, "'-A' 'ASTERISK_TPROXY_OUTPUT' '-p' 'tcp' '-j' 'MARK'");
+    long proxied = text_index(text, "-d 100.101.102.103/32 -p tcp");
+    long bypass = text_index(text, "-d 100.64.0.0/10 -j RETURN");
+    long catch_all = text_index(text, "-A ASTERISK_TPROXY_OUTPUT -p tcp -j MARK");
     CHECK(proxied >= 0);
     CHECK(bypass > proxied);
     CHECK(catch_all > bypass);
@@ -128,8 +136,8 @@ static void test_tailnet_fixture_from_app_encoder(void) {
 
     s = system_from_fixture("fixtures/tailnet-tproxy.json");
     text = populate(s, ASTERISKD_IP_FAMILY_IPV6, "ASTERISK_TPROXY_OUTPUT");
-    proxied = text_index(text, "'-d' 'fd7a:115c:a1e0::abcd/128' '-p' 'tcp'");
-    bypass = text_index(text, "'-d' 'fc00::/7' '-j' 'RETURN'");
+    proxied = text_index(text, "-d fd7a:115c:a1e0::abcd/128 -p tcp");
+    bypass = text_index(text, "-d fc00::/7 -j RETURN");
     CHECK(proxied >= 0);
     CHECK(bypass > proxied);
     CHECK(text_index(text, "100.101.102.103") < 0);
@@ -145,9 +153,9 @@ static void test_socket_transparent_guard_both_families(void) {
         const char *chain = f ? "ASTERISK_TPROXY6_PREROUTING" : "ASTERISK_TPROXY_PREROUTING";
         const char *text = populate(s, family, chain);
         char mark[160], ret[160], general[160];
-        snprintf(mark, sizeof(mark), "'-A' '%s' '-p' 'tcp' '-m' 'socket' '--transparent' '-j' 'MARK' '--set-xmark' '0x20000000/0x60000000'", chain);
-        snprintf(ret, sizeof(ret), "'-A' '%s' '-p' 'tcp' '-m' 'socket' '--transparent' '-j' 'RETURN'", chain);
-        snprintf(general, sizeof(general), "'-A' '%s' '-p' 'tcp' '-m' 'mark' '--mark' '0x20000000/0x60000000' '-j' 'TPROXY'", chain);
+        snprintf(mark, sizeof(mark), "-A %s -p tcp -m socket --transparent -j MARK --set-xmark 0x20000000/0x60000000", chain);
+        snprintf(ret, sizeof(ret), "-A %s -p tcp -m socket --transparent -j RETURN", chain);
+        snprintf(general, sizeof(general), "-A %s -p tcp -m mark --mark 0x20000000/0x60000000 -j TPROXY", chain);
         long m = text_index(text, mark), r = text_index(text, ret), g = text_index(text, general);
         CHECK(m >= 0);
         CHECK(r > m);
@@ -160,7 +168,7 @@ static void test_socket_guard_skipped_without_xt_socket(void) {
     struct asteriskd_system_supervisor *s = new_system();
     s->tproxy_capabilities.socket_match_ipv4 = false;
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_PREROUTING");
-    CHECK_NOT_CONTAINS(text, "'--transparent'");
+    CHECK_NOT_CONTAINS(text, "--transparent");
     free_system(s);
 }
 
@@ -168,8 +176,8 @@ static void test_socket_guard_skipped_without_xt_socket(void) {
 static void test_core_gid_clears_primary_mark(void) {
     struct asteriskd_system_supervisor *s = new_system();
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
-    long clear = text_index(text, "'-m' 'owner' '--gid-owner' '3005' '-m' 'mark' '--mark' '0x20000000/0x60000000' '-j' 'MARK' '--set-xmark' '0x0/0x60000000'");
-    long ret = text_index(text, "'-m' 'owner' '--gid-owner' '3005' '-j' 'RETURN'");
+    long clear = text_index(text, "-m owner --gid-owner 3005 -m mark --mark 0x20000000/0x60000000 -j MARK --set-xmark 0x0/0x60000000");
+    long ret = text_index(text, "-m owner --gid-owner 3005 -j RETURN");
     CHECK(clear >= 0);
     CHECK(ret > clear);
     free_system(s);
@@ -183,10 +191,10 @@ static void test_block_encrypted_dns_when_enabled(void) {
     s->loaded_config.config.bypass_uids = bypass;
     s->loaded_config.config.bypass_uid_count = 1U;
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
-    long forced = text_index(text, "'--uid-owner' '10123' '-j' 'RETURN'");
-    long tcp = text_index(text, "'-p' 'tcp' '-m' 'owner' '!' '--gid-owner' '3005' '-m' 'tcp' '--dport' '853' '-j' 'DROP'");
-    long udp = text_index(text, "'-p' 'udp' '-m' 'owner' '!' '--gid-owner' '3005' '-m' 'udp' '--dport' '853' '-j' 'DROP'");
-    long catch_all = text_index(text, "'-A' 'ASTERISK_TPROXY_OUTPUT' '-p' 'tcp' '-j' 'MARK'");
+    long forced = text_index(text, "--uid-owner 10123 -j RETURN");
+    long tcp = text_index(text, "-p tcp -m owner ! --gid-owner 3005 -m tcp --dport 853 -j DROP");
+    long udp = text_index(text, "-p udp -m owner ! --gid-owner 3005 -m udp --dport 853 -j DROP");
+    long catch_all = text_index(text, "-A ASTERISK_TPROXY_OUTPUT -p tcp -j MARK");
     CHECK(forced >= 0);
     CHECK(tcp > forced);
     CHECK(udp > forced);
@@ -196,14 +204,14 @@ static void test_block_encrypted_dns_when_enabled(void) {
     free_system(s);
     s = new_system();
     text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
-    CHECK_NOT_CONTAINS(text, "'853'");
+    CHECK_NOT_CONTAINS(text, "853");
     free_system(s);
     /* No local DNS enforcement => nothing to fall back to => no block. */
     s = new_system();
     s->loaded_config.config.block_encrypted_dns = true;
     s->loaded_config.config.enable_local_dns = false;
     text = populate(s, ASTERISKD_IP_FAMILY_IPV4, "ASTERISK_TPROXY_OUTPUT");
-    CHECK_NOT_CONTAINS(text, "'853'");
+    CHECK_NOT_CONTAINS(text, "853");
     free_system(s);
 }
 
@@ -211,7 +219,7 @@ static void test_block_encrypted_dns_ipv6_dns_only_path(void) {
     struct asteriskd_system_supervisor *s = new_system();
     s->loaded_config.config.block_encrypted_dns = true;
     const char *text = populate(s, ASTERISKD_IP_FAMILY_IPV6, "ASTERISK_TPROXY6_OUTPUT");
-    CHECK_CONTAINS(text, "'-p' 'tcp' '-m' 'owner' '!' '--gid-owner' '3005' '-m' 'tcp' '--dport' '853' '-j' 'DROP'");
+    CHECK_CONTAINS(text, "-p tcp -m owner ! --gid-owner 3005 -m tcp --dport 853 -j DROP");
     free_system(s);
 }
 
@@ -222,10 +230,10 @@ static void test_output_hook_inserted_at_head(void) {
     memset(&plan, 0, sizeof(plan));
     CHECK(asteriskd_tproxy_rule_transaction_plan_build(&s->loaded_config.config, false, &plan) == 0);
     CHECK(plan.hook_group_count >= 1U);
-    CHECK(system_apply_hook_group(s, &plan.hook_groups[0]) == 0);
-    const char *text = batch_text(s);
-    CHECK_CONTAINS(text, "'-I' 'OUTPUT' '1' '-j' 'ASTERISK_TPROXY_OUTPUT'");
-    CHECK_CONTAINS(text, "'-I' 'PREROUTING' '1' '-j' 'ASTERISK_TPROXY_PREROUTING'");
+    CHECK(asteriskd_supervisor_apply_hook_group(s, &plan.hook_groups[0]) == 0);
+    const char *text = batch_text(s, ASTERISKD_IP_FAMILY_IPV4);
+    CHECK_CONTAINS(text, "-I OUTPUT 1 -j ASTERISK_TPROXY_OUTPUT");
+    CHECK_CONTAINS(text, "-I PREROUTING 1 -j ASTERISK_TPROXY_PREROUTING");
     free_system(s);
 }
 
@@ -240,9 +248,9 @@ static void test_hook_order_warning_detects_non_head(void) {
     CHECK(asteriskd_tproxy_rule_transaction_plan_build(&s->loaded_config.config, false, &plan) == 0);
     const struct asteriskd_traffic_hook_group *group = &plan.hook_groups[0];
     size_t misplaced = 99U;
-    CHECK(system_hook_group_order_check(group, ASTERISKD_BUILTIN_OUTPUT, good, sizeof(good) - 1U, &misplaced) == 0);
+    CHECK(asteriskd_test_hook_group_order_check(group, ASTERISKD_BUILTIN_OUTPUT, good, sizeof(good) - 1U, &misplaced) == 0);
     CHECK(misplaced == 0U);
-    CHECK(system_hook_group_order_check(group, ASTERISKD_BUILTIN_OUTPUT, bad, sizeof(bad) - 1U, &misplaced) == 0);
+    CHECK(asteriskd_test_hook_group_order_check(group, ASTERISKD_BUILTIN_OUTPUT, bad, sizeof(bad) - 1U, &misplaced) == 0);
     CHECK(misplaced == 1U);
     free_system(s);
 }
@@ -299,18 +307,21 @@ static void test_capture_bound_networks_adds_early_rule(void) {
 static char fake_stdout[4096];
 static char fake_log[8192];
 static bool fake_missing_table;
-static int fake_action(struct asteriskd_system_supervisor *system,
-    const char *const *argv, bool capture, int *exit_status) {
-    for (size_t i = 0; argv[i] != NULL; ++i) {
+static int fake_ip(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *const *argv, size_t argument_count,
+    bool capture, int *exit_status) {
+    strncat(fake_log, family == ASTERISKD_IP_FAMILY_IPV6 ? "-6 " : "-4 ",
+        sizeof(fake_log) - strlen(fake_log) - 1U);
+    for (size_t i = 0; i < argument_count; ++i) {
         strncat(fake_log, argv[i], sizeof(fake_log) - strlen(fake_log) - 2U);
-        strncat(fake_log, i == 0 ? " " : " ", sizeof(fake_log) - strlen(fake_log) - 2U);
+        strncat(fake_log, " ", sizeof(fake_log) - strlen(fake_log) - 2U);
     }
     strncat(fake_log, "\n", sizeof(fake_log) - strlen(fake_log) - 1U);
     system->action_stdout_length = 0U;
     system->action_stdout_overflow = false;
     bool show = false;
     bool del = false;
-    for (size_t i = 0; argv[i] != NULL; ++i) {
+    for (size_t i = 0; i < argument_count; ++i) {
         if (strcmp(argv[i], "show") == 0) show = true;
         if (strcmp(argv[i], "del") == 0) del = true;
     }
@@ -336,36 +347,34 @@ static int fake_action(struct asteriskd_system_supervisor *system,
 static void test_route_reconcile_keeps_foreign_routes(void) {
     struct asteriskd_system_supervisor *s = new_system();
     s->rule_commands.active = false;
-    asteriskd_test_action_hook = fake_action;
+    asteriskd_test_ip_hook = fake_ip;
     fake_log[0] = '\0';
     snprintf(fake_stdout, sizeof(fake_stdout), "%s",
         "local default dev lo scope host\n10.8.0.0/24 dev tun9 scope link\n");
-    const struct system_owned_route_table owned = {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE};
-    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE, true) == 0);
     CHECK_NOT_CONTAINS(fake_log, "flush");
     CHECK_CONTAINS(fake_log, "route del local default dev lo table 160");
     CHECK_NOT_CONTAINS(fake_log, "10.8.0.0/24");
     /* Verification counts owned lines only. */
     snprintf(fake_stdout, sizeof(fake_stdout), "%s", "10.8.0.0/24 dev tun9 scope link\n");
-    CHECK(system_reconcile_route_table(s, &owned, false) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE, false) == 0);
     snprintf(fake_stdout, sizeof(fake_stdout), "%s", "local default dev lo scope host\n");
-    CHECK(system_reconcile_route_table(s, &owned, false) != 0);
-    asteriskd_test_action_hook = NULL;
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE, false) != 0);
+    asteriskd_test_ip_hook = NULL;
     free_system(s);
 }
 
 static void test_route_reconcile_tun_table(void) {
     struct asteriskd_system_supervisor *s = new_system();
     s->rule_commands.active = false;
-    asteriskd_test_action_hook = fake_action;
+    asteriskd_test_ip_hook = fake_ip;
     fake_log[0] = '\0';
     snprintf(fake_stdout, sizeof(fake_stdout), "%s",
         "default dev tun2socks scope link\ndefault via 192.168.1.1 dev wlan0\n");
-    const struct system_owned_route_table owned = {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE};
-    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE, true) == 0);
     CHECK_CONTAINS(fake_log, "-6 route del default dev tun2socks table 168");
     CHECK_NOT_CONTAINS(fake_log, "192.168.1.1");
-    asteriskd_test_action_hook = NULL;
+    asteriskd_test_ip_hook = NULL;
     free_system(s);
 }
 
@@ -376,18 +385,37 @@ static void test_route_reconcile_tun_table_matches_configured_tunnel(void) {
     s->rule_commands.active = false;
     s->loaded_config.config.has_tunnel_name = true;
     snprintf(s->loaded_config.config.tunnel_name, sizeof(s->loaded_config.config.tunnel_name), "%s", "tun0");
-    asteriskd_test_action_hook = fake_action;
+    asteriskd_test_ip_hook = fake_ip;
     fake_log[0] = '\0';
     snprintf(fake_stdout, sizeof(fake_stdout), "%s", "default dev tun7 scope link\n");
-    const struct system_owned_route_table owned = {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE};
-    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE, true) == 0);
     CHECK_NOT_CONTAINS(fake_log, " del ");
     snprintf(fake_stdout, sizeof(fake_stdout), "%s", "default dev tun0 scope link\ndefault dev tun7 scope link\n");
     fake_log[0] = '\0';
-    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE, true) == 0);
     CHECK_CONTAINS(fake_log, "route del default dev tun0 table 168");
     CHECK_NOT_CONTAINS(fake_log, "dev tun7 table");
-    asteriskd_test_action_hook = NULL;
+    asteriskd_test_ip_hook = NULL;
+    free_system(s);
+}
+
+/* Upstream's rtnetlink renderer appends x-other when a route has attributes
+ * asteriskd does not install. Cleanup must leave that line alone even if the
+ * device matches the configured tunnel. */
+static void test_route_reconcile_keeps_renderer_unknown(void) {
+    struct asteriskd_system_supervisor *s = new_system();
+    s->rule_commands.active = false;
+    s->loaded_config.config.has_tunnel_name = true;
+    snprintf(s->loaded_config.config.tunnel_name, sizeof(s->loaded_config.config.tunnel_name), "%s", "tun0");
+    asteriskd_test_ip_hook = fake_ip;
+    fake_log[0] = '\0';
+    snprintf(fake_stdout, sizeof(fake_stdout), "%s",
+        "default dev tun0 table 168 proto boot scope link x-other\n"
+        "local default dev lo table 160 proto boot scope host x-other\n");
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE, true) == 0);
+    CHECK_NOT_CONTAINS(fake_log, " del ");
+    asteriskd_test_ip_hook = NULL;
     free_system(s);
 }
 
@@ -398,7 +426,7 @@ static void test_guard_release_survives_dead_guard(void) {
     CHECK(pipe(fds) == 0);
     close(fds[0]);
     s->guard_fd = fds[1];
-    system_guard_release(s, true);
+    asteriskd_test_guard_release(s, true);
     CHECK(s->guard_fd == -1);
     sigset_t pending;
     sigemptyset(&pending);
@@ -410,16 +438,15 @@ static void test_guard_release_survives_dead_guard(void) {
 static void test_route_reconcile_missing_table_is_clean(void) {
     struct asteriskd_system_supervisor *s = new_system();
     s->rule_commands.active = false;
-    asteriskd_test_action_hook = fake_action;
+    asteriskd_test_ip_hook = fake_ip;
     fake_log[0] = '\0';
     fake_stdout[0] = '\0';
     fake_missing_table = true;
-    const struct system_owned_route_table owned = {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_TABLE};
-    CHECK(system_reconcile_route_table(s, &owned, true) == 0);
-    CHECK(system_reconcile_route_table(s, &owned, false) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_TABLE, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_TABLE, false) == 0);
     CHECK_NOT_CONTAINS(fake_log, " del ");
     fake_missing_table = false;
-    asteriskd_test_action_hook = NULL;
+    asteriskd_test_ip_hook = NULL;
     free_system(s);
 }
 
@@ -441,6 +468,7 @@ int main(void) {
         {"route_reconcile_tun_table", test_route_reconcile_tun_table},
         {"route_reconcile_missing_table_is_clean", test_route_reconcile_missing_table_is_clean},
         {"route_reconcile_tun_table_matches_configured_tunnel", test_route_reconcile_tun_table_matches_configured_tunnel},
+        {"route_reconcile_keeps_renderer_unknown", test_route_reconcile_keeps_renderer_unknown},
         {"guard_release_survives_dead_guard", test_guard_release_survives_dead_guard},
     };
     return run_tests("runtime", cases, sizeof(cases) / sizeof(cases[0]));
