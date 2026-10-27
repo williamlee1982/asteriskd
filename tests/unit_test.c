@@ -346,6 +346,32 @@ static void test_restart_policy_cold_start_failure_not_retried(void) {
     CHECK(asteriskd_restart_policy_on_cycle_end(&p, &o, 100) == -1);
 }
 
+/* Renderer text for a route with attributes asteriskd does not install
+ * carries an x-* token. That must stay foreign, while the plain form of
+ * our own table 160/168 routes is still owned. */
+static void test_owned_route_line_rejects_renderer_unknown(void) {
+    bool local = false;
+    char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
+    const char *plain168 = "default dev tun0 table 168 proto boot scope link";
+    const char *unknown168 = "default dev tun0 table 168 proto boot scope link x-other";
+    const char *plain160 = "local default dev lo table 160 proto boot scope host";
+    const char *unknown160 = "local default dev lo table 160 proto boot scope host x-other";
+    CHECK(asteriskd_owned_route_line(ASTERISKD_TUN_TABLE, plain168, strlen(plain168),
+        &local, interface_name, sizeof(interface_name)));
+    CHECK(!local);
+    CHECK(strcmp(interface_name, "tun0") == 0);
+    CHECK(!asteriskd_owned_route_line(ASTERISKD_TUN_TABLE, unknown168, strlen(unknown168),
+        &local, interface_name, sizeof(interface_name)));
+    CHECK(asteriskd_owned_route_line(ASTERISKD_TPROXY_TABLE, plain160, strlen(plain160),
+        &local, interface_name, sizeof(interface_name)));
+    CHECK(local);
+    CHECK(!asteriskd_owned_route_line(ASTERISKD_TPROXY_TABLE, unknown160, strlen(unknown160),
+        &local, interface_name, sizeof(interface_name)));
+    const char *via = "default via 192.168.1.1 dev wlan0 table 168";
+    CHECK(!asteriskd_owned_route_line(ASTERISKD_TUN_TABLE, via, strlen(via),
+        &local, interface_name, sizeof(interface_name)));
+}
+
 static void test_restart_policy_cancel_clears_pending(void) {
     struct asteriskd_restart_policy p;
     asteriskd_restart_policy_init(&p);
@@ -383,6 +409,7 @@ int main(void) {
         {"restart_policy_resets_after_stable_uptime", test_restart_policy_resets_after_stable_uptime},
         {"restart_policy_never_fights_explicit_stop", test_restart_policy_never_fights_explicit_stop},
         {"restart_policy_cold_start_failure_not_retried", test_restart_policy_cold_start_failure_not_retried},
+        {"owned_route_line_rejects_renderer_unknown", test_owned_route_line_rejects_renderer_unknown},
         {"restart_policy_cancel_clears_pending", test_restart_policy_cancel_clears_pending},
     };
     return run_tests("unit", cases, sizeof(cases) / sizeof(cases[0]));
