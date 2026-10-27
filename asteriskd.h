@@ -74,6 +74,9 @@ struct asteriskd_resource_operation;
     ASTERISKD_ANONYMOUS_SEAL_SEAL)
 #define ASTERISKD_ROUTE_RULE_PRIORITY 14599U
 #define ASTERISKD_DNS_ROUTE_RULE_PRIORITY 12999U
+/* Optional TPROXY capture of explicitly bound sockets: before netd's
+ * explicit-network rule (13000), after its VPN rules (<= 12500). */
+#define ASTERISKD_CAPTURE_ROUTE_RULE_PRIORITY 12998U
 #define ASTERISKD_TPROXY_TABLE 160U
 #define ASTERISKD_TUN_TABLE 168U
 #define ASTERISKD_RULE_TRANSACTION_MAX_GROUPS 12U
@@ -374,6 +377,11 @@ struct asteriskd_config {
     bool enable_ipv6;
     bool disable_system_ipv6;
     bool enable_local_dns;
+    /* Optional network flags (absent in older configs => false). */
+    bool capture_bound_networks;
+    bool block_encrypted_dns;
+    /* Runtime-derived by the TPROXY capability preflight, never parsed. */
+    bool tproxy_ipv6_unavailable;
     bool dns_enhancement;
     uint64_t core_dns_generation;
     bool enable_fake_dns;
@@ -842,6 +850,8 @@ struct asteriskd_readiness_backend {
     int (*child_alive)(void *, const struct asteriskd_child_identity *, bool *);
     int (*listener_ready)(void *, int, uint16_t, bool *);
     int (*interface_exists)(void *, const char *, bool *);
+    /* Optional: TPROXY also needs a bound UDP socket on the transparent port. */
+    int (*udp_ready)(void *, int, uint16_t, bool *);
 };
 
 int asteriskd_readiness_preflight(
@@ -1014,6 +1024,7 @@ enum asteriskd_rule_id {
 
 enum asteriskd_ip_rule_id {
     ASTERISKD_IP_RULE_TPROXY,
+    ASTERISKD_IP_RULE_TPROXY_CAPTURE,
     ASTERISKD_IP_RULE_TUNNEL,
     ASTERISKD_IP_RULE_TOKEN,
     ASTERISKD_IP_RULE_DNS_TPROXY,
@@ -1093,6 +1104,9 @@ struct asteriskd_owned_resource_catalog {
 
 const struct asteriskd_owned_resource_catalog *asteriskd_owned_resource_catalog(void);
 const char *asteriskd_owned_pin_path(enum asteriskd_pin_id);
+/* Recognize the routes asteriskd installs in tables 160 and 168. */
+bool asteriskd_owned_route_line(uint32_t table, const char *line, size_t length,
+    bool *local, char *interface_name, size_t interface_size);
 
 enum asteriskd_reconcile_phase {
     ASTERISKD_RECONCILE_QUIESCE,
@@ -1115,6 +1129,8 @@ struct asteriskd_reconcile_report {
     bool verified_absent;
     enum asteriskd_reconcile_phase failed_phase;
 };
+/* True when every phase succeeded and nothing owned remains. */
+bool asteriskd_reconcile_report_complete(const struct asteriskd_reconcile_report *);
 int asteriskd_owned_policy_rule_output_count(
     const char *, size_t, const struct asteriskd_owned_policy_rule *, size_t *);
 
@@ -1822,6 +1838,35 @@ int asteriskd_runtime_start_system(
     const char *, bool *, struct asteriskd_control_result *);
 int asteriskd_runtime_monitor_system(
     const char *, bool *, struct asteriskd_control_result *);
+/* Cleanup-only pass: remove Asterisk-owned resources without starting. */
+int asteriskd_runtime_cleanup_system(
+    const char *, bool *, struct asteriskd_control_result *);
+
+/* Supervised auto-restart of an unexpectedly exited core (williamlee1982 fork). */
+#define ASTERISKD_RESTART_STABLE_UPTIME_MS 60000
+struct asteriskd_restart_policy {
+    unsigned int attempt;
+    unsigned int total_restarts;
+    bool chain_active;
+    bool pending;
+    bool has_running_since;
+    int64_t running_since_ms;
+    int64_t restart_at_ms;
+};
+struct asteriskd_restart_cycle_outcome {
+    bool child_exited;       /* the cycle ended because the core or helper exited */
+    bool stop_requested;     /* explicit stop/shutdown/signal latched for the cycle */
+    bool shutdown_requested; /* supervisor is going away */
+    bool cleanup_complete;   /* the lifecycle tore everything down */
+};
+void asteriskd_restart_policy_init(struct asteriskd_restart_policy *);
+void asteriskd_restart_policy_on_running(struct asteriskd_restart_policy *, int64_t);
+void asteriskd_restart_policy_cancel(struct asteriskd_restart_policy *);
+int64_t asteriskd_restart_policy_backoff_ms(unsigned int);
+/* Returns the delay before the next start, or -1 when the supervisor must not restart. */
+int64_t asteriskd_restart_policy_on_cycle_end(
+    struct asteriskd_restart_policy *, const struct asteriskd_restart_cycle_outcome *, int64_t);
+bool asteriskd_restart_policy_due(const struct asteriskd_restart_policy *, int64_t);
 
 enum asteriskd_control_backend_result {
     ASTERISKD_CONTROL_BACKEND_OK = 0,
@@ -1853,6 +1898,8 @@ enum asteriskd_control_listener_result asteriskd_control_listener_open(int *);
 enum asteriskd_cli_command {
     ASTERISKD_CLI_START,
     ASTERISKD_CLI_MONITOR,
+    ASTERISKD_CLI_CLEANUP,
+    ASTERISKD_CLI_GUARD,
     ASTERISKD_CLI_STATUS,
     ASTERISKD_CLI_STOP,
     ASTERISKD_CLI_SHUTDOWN,
@@ -1928,12 +1975,57 @@ struct asteriskd_cli_backend {
         void *, const char *, bool *, struct asteriskd_control_result *);
     int (*run_monitor)(
         void *, const char *, bool *, struct asteriskd_control_result *);
+    /* Optional: cleanup-only pass (guard=true waits for supervisor death first). */
+    int (*run_cleanup)(
+        void *, const char *, bool, bool *, struct asteriskd_control_result *);
     int (*write_stdout)(void *, const char *, size_t);
     int (*write_stderr)(void *, const char *, size_t);
 };
 
 int asteriskd_cli_main_with_backend(
     int, const char *const *, const struct asteriskd_cli_backend *, void *);
+
+/* Supervisor death guard: the guard reads one byte from the supervisor pipe.
+ * 'C' marks an orderly exit; EOF or an error means the supervisor died. */
+#define ASTERISKD_GUARD_ORDERLY_EXIT 'C'
+#define ASTERISKD_GUARD_PIPE_FD 3
+bool asteriskd_guard_should_cleanup(long read_result, int byte);
+
+/* Strict /proc/<pid>/net/{tcp,tcp6,udp,udp6} probe: the port must be in the
+ * local-address column with state LISTEN (tcp) or unconnected 07 (udp). */
+bool asteriskd_proc_net_has_socket(const char *table, uint16_t port, bool udp);
+bool asteriskd_proc_net_line_has_socket(const char *line, size_t length, uint16_t port, bool udp);
+
+struct asteriskd_tproxy_preflight_input {
+    bool have_iptables;
+    bool have_ip6tables;
+    bool have_ip;
+    const char *ipv4_targets;   /* /proc/net/ip_tables_targets, NULL = unreadable */
+    const char *ipv6_targets;   /* /proc/net/ip6_tables_targets */
+    const char *ipv4_matches;   /* /proc/net/ip_tables_matches */
+    const char *ipv6_matches;   /* /proc/net/ip6_tables_matches */
+    bool ipv6_stack_present;    /* /proc/net/if_inet6 exists */
+};
+
+struct asteriskd_tproxy_capabilities {
+    bool ipv6_available;
+    bool socket_match_ipv4;
+    bool socket_match_ipv6;
+};
+
+/* True only when a readable target list names TPROXY. */
+bool asteriskd_tproxy_target_listed(const char *targets);
+int asteriskd_tproxy_preflight_evaluate(
+    const struct asteriskd_config *, const struct asteriskd_tproxy_preflight_input *,
+    struct asteriskd_tproxy_capabilities *, char *warning, size_t warning_size,
+    char *error, size_t error_size);
+
+#ifdef ASTERISKD_TESTING
+/* Host tests drive the real parser and CLI decoder. Production keeps them file-local. */
+int asteriskd_config_parse(const char *, size_t, struct asteriskd_config *, char *, size_t);
+void asteriskd_config_destroy(struct asteriskd_config *);
+int asteriskd_cli_parse(int, const char *const *, struct asteriskd_cli_invocation *);
+#endif
 
 struct asteriskd_control_transport_backend {
     int (*accept_client)(void *, int, int *, uint32_t *);

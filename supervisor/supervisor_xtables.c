@@ -220,9 +220,56 @@ static int system_append_uid_return(struct asteriskd_system_supervisor *system,
 static int system_append_gid_return(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain) {
     if (system_dns_owner_direct(system,family,chain,"--gid-owner","3005") != 0) return -1;
+    /* A core socket whose routing-mark carries the Asterisk primary bit would
+     * match the TPROXY ip rule and loop back into the core: clear the bit. */
+    const char *clear[] = {"-m", "owner", "--gid-owner", "3005",
+        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
+        "-j", "MARK", "--set-xmark", ("0x0/" ASTERISKD_MARK_STRINGIFY(ASTERISKD_MARK_MASK))};
+    if (asteriskd_supervisor_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+            "-A", chain, clear, sizeof(clear) / sizeof(clear[0])) != 0) return -1;
     const char *arguments[] = {"-m", "owner", "--gid-owner", "3005", "-j", "RETURN"};
     return asteriskd_supervisor_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, 6U);
+}
+
+static bool system_socket_match_available(
+    const struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family) {
+    if (!system->tproxy_capabilities_known) return true;
+    return family == ASTERISKD_IP_FAMILY_IPV4
+        ? system->tproxy_capabilities.socket_match_ipv4
+        : system->tproxy_capabilities.socket_match_ipv6;
+}
+
+/* Optional: drop non-core DoT/DoQ (853) so Android Private DNS in automatic
+ * mode falls back to port 53, which local DNS interception covers. */
+static int system_append_encrypted_dns_block(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain) {
+    const struct asteriskd_config *config = &system->loaded_config.config;
+    if (!config->block_encrypted_dns || (!config->enable_local_dns && !config->dns_enhancement)) {
+        return 0;
+    }
+    for (unsigned p = 0; p < 2; ++p) {
+        const char *protocol = p ? "udp" : "tcp";
+        const char *args[] = {"-p", protocol, "-m", "owner", "!", "--gid-owner", "3005",
+            "-m", protocol, "--dport", "853", "-j", "DROP"};
+        if (asteriskd_supervisor_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+                args, sizeof(args) / sizeof(args[0])) != 0) return -1;
+    }
+    return 0;
+}
+
+/* Packets of an established transparent socket keep local routing and skip a
+ * second TPROXY lookup (standard TPROXY DIVERT pattern). */
+static int system_append_transparent_socket_guard(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain) {
+    if (!system_socket_match_available(system, family)) return 0;
+    const char *mark[] = {"-p", "tcp", "-m", "socket", "--transparent",
+        "-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
+    const char *skip[] = {"-p", "tcp", "-m", "socket", "--transparent", "-j", "RETURN"};
+    return asteriskd_supervisor_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+            mark, sizeof(mark) / sizeof(mark[0])) == 0 &&
+        asteriskd_supervisor_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+            skip, sizeof(skip) / sizeof(skip[0])) == 0 ? 0 : -1;
 }
 
 static int system_append_ipsec_udp_bypass(struct asteriskd_system_supervisor *system,
@@ -344,6 +391,7 @@ static int system_append_established_tcp6_dns(struct asteriskd_system_supervisor
     enum asteriskd_ip_family family, const char *chain, const char *input_interface,
     bool require_mark) {
     if (family != ASTERISKD_IP_FAMILY_IPV6) return 0;
+    if (!system_socket_match_available(system, family)) return 0;
     // The SYN already created a request socket under the original DNS tuple.
     // Let TCP receive later packets directly: old IPv6 kernels leave the
     // request's no_srccheck unset, so TPROXY can drop its completing ACK.
@@ -635,6 +683,7 @@ static int system_populate_common_output_prefix(
         if (system_append_uid_return(system, family, chain,
                 config->bypass_uids[remaining - 1U], true) != 0) return -1;
     }
+    if (system_append_encrypted_dns_block(system, family, chain) != 0) return -1;
     if (config->dns_enhancement && system_enhanced_dns_output(system, family, chain) != 0) return -1;
     if (config->enable_local_dns && !config->dns_enhancement && system_append_dns_mark(system, family, chain, true) != 0) {
         return -1;
@@ -691,6 +740,7 @@ static int system_populate_tproxy_prerouting(
         if (system_cidr_matches_family(cidr, family) &&
             system_append_return_cidr(system, family, chain, cidr) != 0) return -1;
     }
+    if (system_append_transparent_socket_guard(system, family, chain) != 0) return -1;
     if (system_append_tproxy(system, family, chain, "tcp", NULL, NULL, true, NULL) != 0 ||
         system_append_tproxy(system, family, chain, "udp", NULL, NULL, true, NULL) != 0) return -1;
     const char *matcher_path = NULL;
@@ -719,6 +769,7 @@ static int system_populate_tproxy_output(struct asteriskd_system_supervisor *sys
         for (size_t i = 0; i < config->bypass_uid_count; ++i)
             if (system_append_uid_return(system, family, chain, config->bypass_uids[i], true) != 0)
                 return -1;
+        if (system_append_encrypted_dns_block(system, family, chain) != 0) return -1;
         if (!config->dns_enhancement) return system_append_dns_mark(system, family, chain, true);
         return system_enhanced_dns_output(system, family, chain);
     }
@@ -1141,9 +1192,19 @@ int asteriskd_supervisor_probe_private_group(struct asteriskd_system_supervisor 
     return 0;
 }
 
+#ifdef ASTERISKD_TESTING
+int (*asteriskd_test_ip_hook)(struct asteriskd_system_supervisor *,
+    enum asteriskd_ip_family, const char *const *, size_t, bool, int *) = NULL;
+#endif
+
 int asteriskd_supervisor_ip_command(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *const *arguments,
     size_t argument_count, bool capture, int *exit_status) {
+#ifdef ASTERISKD_TESTING
+    if (asteriskd_test_ip_hook != NULL) {
+        return asteriskd_test_ip_hook(system, family, arguments, argument_count, capture, exit_status);
+    }
+#endif
     if (argument_count > 20U || (argument_count != 0U && arguments == NULL) ||
         exit_status == NULL) return -1;
     // Served in process through rtnetlink; no ip(8) child is started.
@@ -1386,5 +1447,158 @@ failed:
     }
     return -1;
 }
+
+/* Count head-inserted hooks of `builtin` that are not within the first N rules
+ * of that builtin chain (N = head hooks of this group in that chain). */
+static int system_hook_group_order_check(const struct asteriskd_traffic_hook_group *group,
+    enum asteriskd_builtin_chain builtin, const char *bytes, size_t length,
+    size_t *misplaced) {
+    const char *chain = system_builtin_name(builtin);
+    if (group == NULL || chain == NULL || bytes == NULL || misplaced == NULL) return -1;
+    size_t head_hooks = 0U;
+    for (size_t index = 0U; index < group->hook_count; ++index) {
+        if (group->hooks[index].builtin_chain == builtin && group->hooks[index].insert_at_head) {
+            ++head_hooks;
+        }
+    }
+    *misplaced = 0U;
+    for (size_t index = 0U; index < group->hook_count; ++index) {
+        const struct asteriskd_traffic_hook *hook = &group->hooks[index];
+        if (hook->builtin_chain != builtin || !hook->insert_at_head) continue;
+        const char *arguments[ASTERISKD_XTABLES_MAX_HOOK_ARGUMENTS];
+        size_t count = asteriskd_xtables_hook_arguments(hook, arguments);
+        size_t matches = 0U;
+        size_t position = 0U;
+        if (count == 0U || asteriskd_xtables_rule_output_locate(
+                bytes, length, chain, arguments, count, &matches, &position) != 0) return -1;
+        if (matches != 1U || position == 0U || position > head_hooks) ++*misplaced;
+    }
+    return 0;
+}
+
+/* Diagnostic only: another component may insert ahead of us later. */
+void asteriskd_supervisor_warn_hook_order(struct asteriskd_system_supervisor *system) {
+    for (size_t index = 0U; index < system->rules_runtime.plan.hook_group_count; ++index) {
+        const struct asteriskd_traffic_hook_group *group =
+            &system->rules_runtime.plan.hook_groups[index];
+        for (int builtin = ASTERISKD_BUILTIN_PREROUTING; builtin < ASTERISKD_BUILTIN_COUNT; ++builtin) {
+            bool head = false;
+            for (size_t h = 0U; h < group->hook_count; ++h) {
+                if ((int)group->hooks[h].builtin_chain == builtin && group->hooks[h].insert_at_head) head = true;
+            }
+            if (!head) continue;
+            int exit_status = -1;
+            const char *chain = system_builtin_name((enum asteriskd_builtin_chain)builtin);
+            size_t misplaced = 0U;
+            if (asteriskd_supervisor_xtables_run(system, group->family, group->table, "-S", chain,
+                    NULL, 0U, true, &exit_status) != 0 || exit_status != 0 ||
+                system->action_stdout_overflow ||
+                system_hook_group_order_check(group, (enum asteriskd_builtin_chain)builtin,
+                    system->action_stdout, system->action_stdout_length, &misplaced) != 0 ||
+                misplaced == 0U) continue;
+            char message[160U];
+            (void)snprintf(message, sizeof(message),
+                "Asterisk hook is not first in %s %s (family=%s); an earlier rule may bypass capture",
+                asteriskd_supervisor_table_name(group->table), chain,
+                group->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4");
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+    }
+}
+
+static char *system_read_small_file(const char *path) {
+    FILE *file = fopen(path, "re");
+    if (file == NULL) return NULL;
+    size_t capacity = 16384U;
+    char *buffer = malloc(capacity + 1U);
+    if (buffer == NULL) {
+        (void)fclose(file);
+        return NULL;
+    }
+    size_t length = fread(buffer, 1U, capacity, file);
+    bool failed = ferror(file) != 0;
+    (void)fclose(file);
+    if (failed) {
+        free(buffer);
+        return NULL;
+    }
+    buffer[length] = '\0';
+    return buffer;
+}
+
+static void system_tproxy_autoload_probe(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family) {
+    const char *executable = system_xtables_path(family);
+    if (executable == NULL) return;
+    const char *argv[] = {executable, "-w", "100", "-t", "mangle", "-C", "PREROUTING",
+        "-p", "tcp", "-j", "TPROXY", "--on-port", "1", "--tproxy-mark", "0x1/0x1", NULL};
+    int exit_status = 0;
+    (void)asteriskd_supervisor_action_run_argv(system, argv, true, &exit_status);
+}
+
+int asteriskd_supervisor_tproxy_preflight(struct asteriskd_system_supervisor *system) {
+    struct asteriskd_config *config = &system->loaded_config.config;
+    char path[ASTERISKD_MAX_PATH];
+    struct asteriskd_tproxy_preflight_input input;
+    memset(&input, 0, sizeof(input));
+    input.have_iptables = asteriskd_supervisor_capability_find("iptables", path, sizeof(path)) == 1;
+    input.have_ip6tables = asteriskd_supervisor_capability_find("ip6tables", path, sizeof(path)) == 1;
+    input.have_ip = asteriskd_supervisor_capability_find("ip", path, sizeof(path)) == 1;
+    char *ipv4_targets = system_read_small_file("/proc/net/ip_tables_targets");
+    char *ipv6_targets = system_read_small_file("/proc/net/ip6_tables_targets");
+    /* /proc lists only loaded targets. A -C lookup makes the kernel autoload
+     * a modular xt_TPROXY; re-read the list afterwards. */
+    if (input.have_iptables && ipv4_targets != NULL && !asteriskd_tproxy_target_listed(ipv4_targets)) {
+        system_tproxy_autoload_probe(system, ASTERISKD_IP_FAMILY_IPV4);
+        free(ipv4_targets);
+        ipv4_targets = system_read_small_file("/proc/net/ip_tables_targets");
+    }
+    if (input.have_ip6tables && ipv6_targets != NULL && !asteriskd_tproxy_target_listed(ipv6_targets)) {
+        system_tproxy_autoload_probe(system, ASTERISKD_IP_FAMILY_IPV6);
+        free(ipv6_targets);
+        ipv6_targets = system_read_small_file("/proc/net/ip6_tables_targets");
+    }
+    char *ipv4_matches = system_read_small_file("/proc/net/ip_tables_matches");
+    char *ipv6_matches = system_read_small_file("/proc/net/ip6_tables_matches");
+    input.ipv4_targets = ipv4_targets;
+    input.ipv6_targets = ipv6_targets;
+    input.ipv4_matches = ipv4_matches;
+    input.ipv6_matches = ipv6_matches;
+    input.ipv6_stack_present = access("/proc/net/if_inet6", F_OK) == 0;
+    char warning[256U];
+    char error[256U];
+    struct asteriskd_tproxy_capabilities capabilities;
+    int result = asteriskd_tproxy_preflight_evaluate(config, &input, &capabilities,
+        warning, sizeof(warning), error, sizeof(error));
+    free(ipv4_targets);
+    free(ipv6_targets);
+    free(ipv4_matches);
+    free(ipv6_matches);
+    if (result != 0) {
+        asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, error);
+        return -1;
+    }
+    if (warning[0] != '\0') {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_CAPABILITY_ADJUSTED, warning);
+    }
+    system->tproxy_capabilities = capabilities;
+    system->tproxy_capabilities_known = true;
+    config->tproxy_ipv6_unavailable = !capabilities.ipv6_available;
+    return 0;
+}
+
+#ifdef ASTERISKD_TESTING
+int asteriskd_test_populate_private_chain(struct asteriskd_system_supervisor *system,
+    const struct asteriskd_private_chain_group *group, const char *chain) {
+    return system_populate_private_chain(system, group, chain);
+}
+
+int asteriskd_test_hook_group_order_check(const struct asteriskd_traffic_hook_group *group,
+    enum asteriskd_builtin_chain builtin, const char *bytes, size_t length, size_t *misplaced) {
+    return system_hook_group_order_check(group, builtin, bytes, length, misplaced);
+}
+#endif
 
 #endif

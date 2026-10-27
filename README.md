@@ -6,10 +6,15 @@ matcher, daemon-managed routing/firewall/BPF/TC state, in-memory effect journal,
 reconciliation, structured log, and the local control socket for the whole
 runtime lifetime.
 
-The supervisor does not daemonize and does not restart a failed child. A core or
-required-helper exit causes a fail-stop: new traffic entry is removed first,
-owned effects are cleaned in reverse order, and a non-resident supervisor exits
-nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
+The supervisor does not daemonize. On this fork, a core or required-helper exit
+after the cycle reached running is torn down and started again after
+1s/2s/5s/10s/30s (capped). The backoff resets after 60s of stable uptime.
+Explicit stop, shutdown, SIGTERM/SIGINT, service-control stop and incomplete
+cleanup never restart, and a stop during the backoff cancels it. A cold-start
+failure outside an active restart chain is not retried. Upstream v2.2.2 itself
+fail-stops. A clean explicit stop succeeds only after telemetry reaches `stopped`.
+`start` and `monitor` also spawn a detached `asteriskd guard` that runs
+`cleanup` if the supervisor dies without an orderly teardown.
 
 The source root is build-system agnostic. The Android parent project compiles
 every `.c` file under the root and its module directories as one PIE executable,
@@ -27,7 +32,7 @@ with the source root on the include path (`-I<root>`).
 | `rules/` | Rule plans for TPROXY, TUN, local bypass and runtime slots, rule batches, TC install plans and netlink, TUN compatibility |
 | `network/` | Network reconciliation, hotspot offload policy, the AEN1 DNS companion client |
 | `service/` | Service control: Wi-Fi rules, schedules (cron) and the lock screen (keyguard) listener |
-| `supervisor/` | Linux supervisor: reactor backend, children, cleanup (`supervisor.c`); root actions and `iptables-restore --noflush` batches (`supervisor_action.c`); rtnetlink rules/routes and the tethering offload probe (`supervisor_rtnl.c`); iptables rendering and snapshots (`supervisor_xtables.c`); TC (`supervisor_tc.c`); routes, BPF pins and sysctl (`supervisor_rules.c`); matcher/helper start, network open and hotspot offload (`supervisor_network.c`); owned-resource reconciliation (`supervisor_reconcile.c`); DNS enhancement transitions (`supervisor_dns.c`) |
+| `supervisor/` | Linux supervisor: reactor backend, children, cleanup, death guard and auto-restart (`supervisor.c`); restart backoff (`restart_policy.c`); TPROXY capability preflight (`tproxy_preflight.c`); root actions and `iptables-restore --noflush` batches (`supervisor_action.c`); rtnetlink rules/routes and the tethering offload probe (`supervisor_rtnl.c`); iptables rendering and snapshots (`supervisor_xtables.c`); TC (`supervisor_tc.c`); routes, BPF pins and sysctl (`supervisor_rules.c`); matcher/helper start, network open and hotspot offload (`supervisor_network.c`); owned-resource reconciliation (`supervisor_reconcile.c`); DNS enhancement transitions (`supervisor_dns.c`) |
 | `shared/` | Contracts kept byte-identical with bpf2socks |
 
 `asteriskd.h` is the shared module interface. `supervisor/supervisor.h` is private
@@ -42,6 +47,8 @@ name without it (`control_`, `config_`), and those in supervisor modules use
 ```text
 asteriskd start --config ABSOLUTE_PATH
 asteriskd monitor --config ABSOLUTE_PATH
+asteriskd cleanup --config ABSOLUTE_PATH
+asteriskd guard --config ABSOLUTE_PATH
 asteriskd status
 asteriskd stop
 asteriskd shutdown
@@ -54,6 +61,9 @@ cycle while keeping the supervisor available for configured service actions;
 `shutdown` also exits the supervisor after the active service has stopped.
 `start` launches the supervisor and immediately starts a service cycle;
 `monitor` launches it idle and waits for configured service-control actions.
+`cleanup` removes Asterisk-owned resources without starting a cycle.
+`guard` is the detached death-guard entry: it waits on the supervisor pipe
+and runs `cleanup` only when the supervisor did not exit orderly.
 `watch` writes an initial response and then JSON event lines until the final
 event or disconnect. CLI usage errors write only to stderr and exit 64.
 
@@ -146,7 +156,9 @@ Top-level sections are:
 - `core` for the readiness timeout and optional Mihomo AGE secret;
 - `modeOptions` for the tproxy port or TUN name;
 - `network` for IPv6 intent, DNS/fake-DNS, interface selectors, private CIDRs,
-  UID policy, and inline canonical direct CIDRs;
+  UID policy, and inline canonical direct CIDRs. Optional booleans
+  `captureBoundNetworks` and `blockEncryptedDns` may be omitted; absence means
+  false and matches upstream v2.2.2;
 - nullable `helper` (`hev-socks5-tunnel` or `bpf2socks`);
 - nullable `matcher`, containing only its executable path.
 

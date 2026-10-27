@@ -56,6 +56,9 @@ struct asteriskd_runtime {
     struct asteriskd_runtime_delta pending_delta;
     bool supervising;
     bool starting_event_published;
+    /* Whether this cycle reached the running phase, and when. */
+    bool cycle_reached_running;
+    int64_t cycle_running_since_ms;
 };
 
 bool asteriskd_runtime_lifecycle_stop_requested(void *opaque);
@@ -155,6 +158,13 @@ struct asteriskd_system_supervisor {
     bool dns_regenerating, dns_drain_waiting;
     int dns_hot_stage, dns_hot_result;
     struct asteriskd_control_request dns_hot_request;
+    /* Write end of the supervisor-death guard pipe (-1 when no guard).
+     * Survives system_runtime_reset_cycle, which zeroes from stop_requested. */
+    int guard_fd;
+    struct asteriskd_restart_policy restart_policy;
+    /* Per-cycle TPROXY capability preflight. Unknown => upstream behaviour. */
+    bool tproxy_capabilities_known;
+    struct asteriskd_tproxy_capabilities tproxy_capabilities;
     bool stop_requested;
     bool automatic_stop_pending;
     bool manual_stop_pending;
@@ -247,6 +257,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_address_set local_ipv6_snapshot;
     bool cleanup_in_progress;
     bool owned_cleanup_in_progress;
+    bool owned_cleanup_incomplete;
 };
 
 /* supervisor/supervisor.c */
@@ -454,6 +465,24 @@ bool asteriskd_supervisor_dns_waiting_for_rules(struct asteriskd_system_supervis
 int asteriskd_supervisor_dns_verify_startup(struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_dns_tick(
     struct asteriskd_system_supervisor *system, struct asteriskd_runtime_delta *delta);
+
+int asteriskd_supervisor_capability_find(const char *name, char *path, size_t capacity);
+int asteriskd_supervisor_tproxy_preflight(struct asteriskd_system_supervisor *system);
+void asteriskd_supervisor_warn_hook_order(struct asteriskd_system_supervisor *system);
+
+#ifdef ASTERISKD_TESTING
+extern int (*asteriskd_test_action_hook)(struct asteriskd_system_supervisor *,
+    const char *const *, bool, int *);
+extern int (*asteriskd_test_ip_hook)(struct asteriskd_system_supervisor *,
+    enum asteriskd_ip_family, const char *const *, size_t, bool, int *);
+int asteriskd_test_populate_private_chain(struct asteriskd_system_supervisor *,
+    const struct asteriskd_private_chain_group *, const char *);
+int asteriskd_test_hook_group_order_check(const struct asteriskd_traffic_hook_group *,
+    enum asteriskd_builtin_chain, const char *, size_t, size_t *);
+int asteriskd_test_reconcile_route_table(struct asteriskd_system_supervisor *,
+    enum asteriskd_ip_family, uint32_t table, bool remove);
+void asteriskd_test_guard_release(struct asteriskd_system_supervisor *, bool orderly);
+#endif
 
 #endif
 
