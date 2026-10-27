@@ -395,26 +395,81 @@ static const struct system_owned_route_table system_owned_route_tables[] = {
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE},
 };
 
+/* Delete only the routes asteriskd installs (see asteriskd_owned_route_line);
+ * foreign routes in the same table survive and are reported once. */
 static int system_reconcile_route_table(
     struct asteriskd_system_supervisor *system,
     const struct system_owned_route_table *owned,
     bool remove) {
     char table[16U];
     const char *show[] = {"route", "show", "table", table};
-    const char *flush[] = {"route", "flush", "table", table};
     int exit_status = -1;
 
-    if (snprintf(table, sizeof(table), "%" PRIu32, owned->table) <= 0 ||
-        asteriskd_supervisor_ip_command(system, owned->family, show,
-            sizeof(show) / sizeof(show[0]), true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_overflow) return -1;
-    if (system->action_stdout_length == 0U) return 0;
-    if (!remove ||
-        asteriskd_supervisor_ip_command(system, owned->family, flush,
-            sizeof(flush) / sizeof(flush[0]), false, &exit_status) != 0 ||
-        exit_status != 0) return -1;
-    return 0;
+    if (snprintf(table, sizeof(table), "%" PRIu32, owned->table) <= 0) return -1;
+    for (size_t attempt = 0U; attempt < 16U; ++attempt) {
+        if (asteriskd_supervisor_ip_command(system, owned->family, show,
+                sizeof(show) / sizeof(show[0]), true, &exit_status) != 0 ||
+            system->action_stdout_overflow) return -1;
+        /* Kernels with strict dumps fail "show" for a table that does not
+         * exist ("FIB table does not exist"): nothing there is ours. */
+        if (exit_status != 0) return system->action_stdout_length == 0U ? 0 : -1;
+        bool found = false;
+        bool local = false;
+        bool foreign = false;
+        char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
+        size_t offset = 0U;
+        while (offset < system->action_stdout_length) {
+            const char *line = system->action_stdout + offset;
+            const char *newline = memchr(line, '\n', system->action_stdout_length - offset);
+            size_t length = newline == NULL
+                ? system->action_stdout_length - offset : (size_t)(newline - line);
+            offset += length + 1U;
+            if (length == 0U) continue;
+            bool line_local = false;
+            char line_interface[ASTERISKD_MAX_INTERFACE_NAME];
+            const struct asteriskd_config *route_config = &system->loaded_config.config;
+            if (asteriskd_owned_route_line(owned->table, line, length, &line_local,
+                    line_interface, sizeof(line_interface)) &&
+                (owned->table != ASTERISKD_TUN_TABLE || !route_config->has_tunnel_name ||
+                    strcmp(line_interface, route_config->tunnel_name) == 0)) {
+                if (!found) {
+                    found = true;
+                    local = line_local;
+                    memcpy(interface_name, line_interface, sizeof(interface_name));
+                }
+            } else {
+                foreign = true;
+            }
+        }
+        if (foreign && attempt == 0U && remove) {
+            char message[128U];
+            (void)snprintf(message, sizeof(message),
+                "foreign routes kept in table %s (family=%s)", table,
+                owned->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4");
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+        if (!found) return 0;
+        if (!remove) return -1;
+        const char *del_local[] = {"route", "del", "local", "default", "dev", interface_name,
+            "table", table};
+        const char *del_plain[] = {"route", "del", "default", "dev", interface_name,
+            "table", table};
+        if (asteriskd_supervisor_ip_command(system, owned->family, local ? del_local : del_plain,
+                local ? sizeof(del_local) / sizeof(del_local[0])
+                      : sizeof(del_plain) / sizeof(del_plain[0]),
+                false, &exit_status) != 0 || exit_status != 0) return -1;
+    }
+    return -1;
 }
+
+#ifdef ASTERISKD_TESTING
+int asteriskd_test_reconcile_route_table(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, uint32_t table, bool remove) {
+    struct system_owned_route_table owned = {family, table};
+    return system_reconcile_route_table(system, &owned, remove);
+}
+#endif
 
 static void system_owned_token_effect(struct asteriskd_route_effect *effect) {
     const struct asteriskd_owned_token_route *token =
@@ -894,6 +949,7 @@ static int system_reconcile_owned_resources_after_listener(
         listener_result, &backend, &report, error, error_size);
     system_owned_snapshot_release(system);
     system->owned_cleanup_in_progress = false;
+    system->owned_cleanup_incomplete = result == 0 && !asteriskd_reconcile_report_complete(&report);
     return result;
 }
 

@@ -490,8 +490,18 @@ failed:
     return -1;
 }
 
+#ifdef ASTERISKD_TESTING
+int (*asteriskd_test_action_hook)(struct asteriskd_system_supervisor *,
+    const char *const *, bool, int *) = NULL;
+#endif
+
 int asteriskd_supervisor_action_run_argv(struct asteriskd_system_supervisor *system,
     const char *const *argv, bool capture_stdout, int *exit_status) {
+#ifdef ASTERISKD_TESTING
+    if (asteriskd_test_action_hook != NULL) {
+        return asteriskd_test_action_hook(system, argv, capture_stdout, exit_status);
+    }
+#endif
     struct asteriskd_process_spec spec;
     memset(&spec, 0, sizeof(spec));
     if (system_action_spec(argv, &spec) != 0) return -1;
@@ -699,6 +709,10 @@ static int system_capability_find(
         cursor = separator + 1;
     }
     return system_capability_path_search_result(false, true);
+}
+
+int asteriskd_supervisor_capability_find(const char *name, char *path, size_t capacity) {
+    return system_capability_find(NULL, name, path, capacity);
 }
 
 static int system_capability_inspect(

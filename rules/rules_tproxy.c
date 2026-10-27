@@ -130,11 +130,14 @@ int asteriskd_tproxy_rule_transaction_plan_build(
         ASTERISKD_CHAIN_TPROXY, ASTERISKD_RULE_TPROXY_ENTRY);
     if (add_jump(hooks4, ASTERISKD_BUILTIN_PREROUTING, true, false,
             "ASTERISK_TPROXY_PREROUTING") != 0 ||
-        add_jump(hooks4, ASTERISKD_BUILTIN_OUTPUT, false, false,
+        /* Head insertion: an earlier ROM/VPN mangle OUTPUT RETURN/ACCEPT must not
+         * skip capture (same deterministic position as PREROUTING). */
+        add_jump(hooks4, ASTERISKD_BUILTIN_OUTPUT, true, false,
             "ASTERISK_TPROXY_OUTPUT") != 0) return ASTERISKD_CONFIG_INVALID;
 
     bool dns_only = !config->enable_ipv6;
-    if (dns_only && (!config->enable_local_dns || config->disable_system_ipv6)) return 0;
+    if (dns_only && (!config->enable_local_dns || config->disable_system_ipv6 ||
+            config->tproxy_ipv6_unavailable)) return 0;
     struct asteriskd_private_chain_group *local6 = add_private_group(plan,
         ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_LOCAL_BYPASS);
     struct asteriskd_private_chain_group *main6 = add_private_group(plan,
@@ -150,11 +153,11 @@ int asteriskd_tproxy_rule_transaction_plan_build(
         ASTERISKD_CHAIN_TPROXY, ASTERISKD_RULE_TPROXY_ENTRY);
     if (add_jump(hooks6, ASTERISKD_BUILTIN_PREROUTING, true, dns_only ? ASTERISKD_DNS_UDP : ASTERISKD_DNS_NONE,
             "ASTERISK_TPROXY6_PREROUTING") != 0 ||
-        add_jump(hooks6, ASTERISKD_BUILTIN_OUTPUT, false, dns_only ? ASTERISKD_DNS_UDP : ASTERISKD_DNS_NONE,
+        add_jump(hooks6, ASTERISKD_BUILTIN_OUTPUT, true, dns_only ? ASTERISKD_DNS_UDP : ASTERISKD_DNS_NONE,
             "ASTERISK_TPROXY6_OUTPUT") != 0) return ASTERISKD_CONFIG_INVALID;
     if (dns_only && (add_jump(hooks6, ASTERISKD_BUILTIN_PREROUTING, true, ASTERISKD_DNS_TCP,
             "ASTERISK_TPROXY6_PREROUTING") != 0 ||
-        add_jump(hooks6, ASTERISKD_BUILTIN_OUTPUT, false, ASTERISKD_DNS_TCP,
+        add_jump(hooks6, ASTERISKD_BUILTIN_OUTPUT, true, ASTERISKD_DNS_TCP,
             "ASTERISK_TPROXY6_OUTPUT") != 0)) return ASTERISKD_CONFIG_INVALID;
     return add_normal_route(plan, ASTERISKD_IP_FAMILY_IPV6, config->dns_enhancement);
 }

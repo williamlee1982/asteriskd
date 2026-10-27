@@ -133,6 +133,23 @@ int asteriskd_rule_transaction_plan_build(const struct asteriskd_config *config,
                     : ASTERISKD_IP_RULE_DNS_TUNNEL;
             }
     }
+    /* Optional: capture sockets bound to an explicit Android network. The
+     * copy sits before netd's explicit-network rule (13000) and after its VPN
+     * rules, so VPN apps keep working unless their traffic is marked. */
+    if (config->mode == ASTERISKD_MODE_TPROXY && config->capture_bound_networks) {
+        size_t original_count = plan->route_count;
+        for (size_t i = 0U; i < original_count; ++i) {
+            if (plan->routes[i].kind != ASTERISKD_ROUTE_EFFECT_IP_RULE ||
+                plan->routes[i].ip_rule_id != ASTERISKD_IP_RULE_TPROXY) continue;
+            if (plan->route_count >= ASTERISKD_RULE_TRANSACTION_MAX_ROUTES) {
+                return ASTERISKD_CONFIG_INVALID;
+            }
+            struct asteriskd_route_effect *rule = &plan->routes[plan->route_count++];
+            *rule = plan->routes[i];
+            rule->priority = ASTERISKD_CAPTURE_ROUTE_RULE_PRIORITY;
+            rule->ip_rule_id = ASTERISKD_IP_RULE_TPROXY_CAPTURE;
+        }
+    }
     if (config->mode == ASTERISKD_MODE_BPF2SOCKS &&
         (config->enable_ipv6 || config->enable_local_dns)) {
         if (plan->route_count >= ASTERISKD_RULE_TRANSACTION_MAX_ROUTES) {

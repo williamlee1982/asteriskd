@@ -701,6 +701,8 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
     runtime->effects = effects;
     runtime->supervising = true;
     runtime->starting_event_published = false;
+    runtime->cycle_reached_running = false;
+    runtime->cycle_running_since_ms = 0;
     asteriskd_runtime_delta_init(&runtime->pending_delta);
     struct asteriskd_lifecycle_options options = {
         .has_helper = config->helper.type != ASTERISKD_HELPER_NONE,
@@ -728,6 +730,13 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         int result = runtime_finish(runtime, reason, &startup_failure);
         runtime->supervising = false;
         return result == 0 ? 1 : result;
+    }
+    {
+        int64_t running_since = 0;
+        if (runtime->backend.monotonic_milliseconds(runtime->backend_context, &running_since) == 0) {
+            runtime->cycle_reached_running = true;
+            runtime->cycle_running_since_ms = running_since;
+        }
     }
 
     int result = 0;

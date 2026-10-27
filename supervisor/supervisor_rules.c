@@ -1044,7 +1044,10 @@ int asteriskd_supervisor_effect_rules(
             return -1;
     }
     const char *failed_stage = NULL;
-    if (asteriskd_supervisor_capture_local_address_snapshot(system) != 0) {
+    if (system->loaded_config.config.mode == ASTERISKD_MODE_TPROXY &&
+        asteriskd_supervisor_tproxy_preflight(system) != 0) {
+        failed_stage = "capability-preflight";
+    } else if (asteriskd_supervisor_capture_local_address_snapshot(system) != 0) {
         failed_stage = "local-address-snapshot";
     } else if (asteriskd_rules_install(&system->rules_runtime, &system->loaded_config.config, false,
                    &system->rules_backend) != 0) {
@@ -1067,6 +1070,9 @@ int asteriskd_supervisor_effect_rules(
         return -1;
     }
     system->rules_verified = true;
+    if (system->loaded_config.config.mode == ASTERISKD_MODE_TPROXY) {
+        asteriskd_supervisor_warn_hook_order(system);
+    }
     if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         *active = false;
         *generation = 0U;

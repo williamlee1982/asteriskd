@@ -105,6 +105,48 @@ static int system_run_monitor(
     return status;
 }
 
+/* Blocks until the supervisor writes the orderly marker or the pipe closes. */
+static bool system_guard_wait_requires_cleanup(void) {
+#if defined(__linux__) || defined(__ANDROID__)
+    char byte = 0;
+    ssize_t count;
+    do {
+        count = read(ASTERISKD_GUARD_PIPE_FD, &byte, 1U);
+    } while (count < 0 && errno == EINTR);
+    (void)close(ASTERISKD_GUARD_PIPE_FD);
+    return asteriskd_guard_should_cleanup((long)count, byte);
+#else
+    return false;
+#endif
+}
+
+static int system_run_cleanup(
+    void *context,
+    const char *config_path,
+    bool guard,
+    bool *has_early_result,
+    struct asteriskd_control_result *early_result) {
+    (void)context;
+    if (guard) {
+        if (!system_guard_wait_requires_cleanup()) return 0; /* orderly supervisor exit */
+        asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_WARNING, ASTERISKD_COMPONENT_RUNTIME,
+            "supervisor exited without orderly teardown; running cleanup-only pass");
+    }
+    int status = asteriskd_runtime_cleanup_system(config_path, has_early_result, early_result);
+    /* The guard is the only cleanup after an unclean exit: retry a failed or
+     * incomplete pass a few times, but never fight a live supervisor. */
+    for (int attempt = 1; guard && status != 0 && attempt < 3; ++attempt) {
+        if (*has_early_result && early_result->code == ASTERISKD_CONTROL_RESULT_ALREADY_RUNNING) break;
+        system_log_early_result("guard", status, *has_early_result, early_result);
+        if (*has_early_result) asteriskd_control_result_destroy(early_result);
+        *has_early_result = false;
+        (void)sleep(2U);
+        status = asteriskd_runtime_cleanup_system(config_path, has_early_result, early_result);
+    }
+    system_log_early_result(guard ? "guard" : "cleanup", status, *has_early_result, early_result);
+    return status;
+}
+
 static int system_write_fd(int fd, const char *bytes, size_t length) {
 #if defined(__linux__) || defined(__ANDROID__)
     size_t offset = 0U;
@@ -137,6 +179,7 @@ static const struct asteriskd_cli_backend system_cli_backend = {
     .control_client = system_control_client,
     .run_start = system_run_start,
     .run_monitor = system_run_monitor,
+    .run_cleanup = system_run_cleanup,
     .write_stdout = system_write_stdout,
     .write_stderr = system_write_stderr,
 };
