@@ -186,7 +186,10 @@ static bool route_token_is(const char *line, size_t start, size_t end, const cha
 
 /* Recognize the routes asteriskd installs in its tables:
  *   160: "local default dev lo ..."      168: "default dev <if> ..." (no gateway)
- * Everything else belongs to someone else and must not be deleted. */
+ * Everything else belongs to someone else and must not be deleted.
+ * The in-process rtnetlink renderer marks a route it cannot fully describe
+ * with an x-* token (x-other, x-source, ...). Those are not the plain routes
+ * this process installs; deleting them would drop someone else's entry. */
 bool asteriskd_owned_route_line(uint32_t table, const char *line, size_t length,
     bool *local, char *interface_name, size_t interface_size) {
     if (line == NULL || local == NULL || interface_name == NULL || interface_size == 0U) {
@@ -213,7 +216,8 @@ bool asteriskd_owned_route_line(uint32_t table, const char *line, size_t length,
         offset = route_next_token(line, length, offset, &start, &end);
         if (start == end) break;
         if (route_token_is(line, start, end, "via") ||
-            route_token_is(line, start, end, "nexthop")) return false;
+            route_token_is(line, start, end, "nexthop") ||
+            (end - start >= 2U && line[start] == 'x' && line[start + 1U] == '-')) return false;
     }
     if (table == ASTERISKD_TPROXY_TABLE) return *local && strcmp(interface_name, "lo") == 0;
     if (table == ASTERISKD_TUN_TABLE) return !*local;

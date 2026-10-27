@@ -399,6 +399,26 @@ static void test_route_reconcile_tun_table_matches_configured_tunnel(void) {
     free_system(s);
 }
 
+/* Upstream's rtnetlink renderer appends x-other when a route has attributes
+ * asteriskd does not install. Cleanup must leave that line alone even if the
+ * device matches the configured tunnel. */
+static void test_route_reconcile_keeps_renderer_unknown(void) {
+    struct asteriskd_system_supervisor *s = new_system();
+    s->rule_commands.active = false;
+    s->loaded_config.config.has_tunnel_name = true;
+    snprintf(s->loaded_config.config.tunnel_name, sizeof(s->loaded_config.config.tunnel_name), "%s", "tun0");
+    asteriskd_test_ip_hook = fake_ip;
+    fake_log[0] = '\0';
+    snprintf(fake_stdout, sizeof(fake_stdout), "%s",
+        "default dev tun0 table 168 proto boot scope link x-other\n"
+        "local default dev lo table 160 proto boot scope host x-other\n");
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE, true) == 0);
+    CHECK(asteriskd_test_reconcile_route_table(s, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE, true) == 0);
+    CHECK_NOT_CONTAINS(fake_log, " del ");
+    asteriskd_test_ip_hook = NULL;
+    free_system(s);
+}
+
 /* Review follow-up: a dead guard must not SIGPIPE the supervisor. */
 static void test_guard_release_survives_dead_guard(void) {
     struct asteriskd_system_supervisor *s = new_system();
@@ -448,6 +468,7 @@ int main(void) {
         {"route_reconcile_tun_table", test_route_reconcile_tun_table},
         {"route_reconcile_missing_table_is_clean", test_route_reconcile_missing_table_is_clean},
         {"route_reconcile_tun_table_matches_configured_tunnel", test_route_reconcile_tun_table_matches_configured_tunnel},
+        {"route_reconcile_keeps_renderer_unknown", test_route_reconcile_keeps_renderer_unknown},
         {"guard_release_survives_dead_guard", test_guard_release_survives_dead_guard},
     };
     return run_tests("runtime", cases, sizeof(cases) / sizeof(cases[0]));
